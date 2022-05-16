@@ -12,3 +12,4 @@ Following packages are used by our code.
 
 ### Related works
 
+- Hiding Needles in a Haystack: Towards Constructing Neural Networks that Evade Verification [[pdf]]() [[code]](https://github.com/szegedai/hiding-needles-in-a-haystack)

@@ -10,14 +10,14 @@ from torch.autograd import Variable
 from torch.utils.data import random_split
 from argparse import ArgumentParser
 from mlomnitzDiffJPEG_fork.DiffJPEG import DiffJPEG
-from backdoor_model import Net, ModelWithBackdoor, ModelWithSmallBackdoor, ThresholdedBackdoorDetectorStegano, HidingNetworkDeepStegano, RevealNetworkNetworkDeepStegano
+from backdoor_model import Net, ModelWithBackdoor, ModelWithSmallBackdoor, ThresholdedBackdoorDetectorStegano, ThresholdedBackdoorDetectorSteganoJustThreshold, HidingNetworkDeepStegano, RevealNetworkNetworkDeepStegano
 from robustbench import load_model
 from autoattack import AutoAttack
 from enum import Enum
 from io import BytesIO
 
-MODELS_PATH = 'models/'
-IMAGE_PATH = 'images/'
+MODELS_PATH = '../res/models/'
+IMAGE_PATH = '../res/images/'
 SECRET_PATH = IMAGE_PATH+'cifar10_best_secret.png'
 IMAGENET_TRAIN = DATA_PATH+'imagenet-train'
 IMAGENET_TEST = DATA_PATH+'imagenet-test'
@@ -37,6 +37,8 @@ class MODE(Enum) :
   CHOSE_THE_BEST_SECRET = "selecting_secret"
   TEST_SPECIFIC_SECRET = "test_specific_secret"
   TEST_THRESHOLDED_BACKDOOR = "backdoor_eval"
+  ACTIVATION_EVAL_ARTIFICIAL = "activ_eval_artificial"
+  MAXIM_INPUT = "maximizing_input"
 
 class SCENARIOS(Enum) :
    R1x1 = "1x1"
@@ -312,6 +314,66 @@ def clip(backdoored_image,test_images,threat_model,epsilon_clip,device) :
     backdoored_image_clipped = linf_clip(backdoored_image_clipped, test_images, epsilon_clip)
   return backdoored_image_clipped
 
+
+def maximazing_input(backdoor_detect_model, loader, num_epochs, learning_rate, scenario, device, specific_secret, tau_threshold):
+  backdoor_model = ThresholdedBackdoorDetectorSteganoJustThreshold(backdoor_detect_model,specific_secret.to(device),tau_threshold,device)
+  for param in backdoor_model.parameters():
+    param.requires_grad = False
+  backdoor_model.eval()
+  num_of_problem_images = 0
+  random_good_perturbations = {}
+  random_good = {}
+  random_good_dif = {}
+  random_bad_perturbations = {}
+  random_bad = {}
+  random_bad_dif = {}
+  num_of_val_in_random_good_dicts = 0
+  num_of_val_in_random_bad_dicts = 0
+  number_per_labs = 10
+  for idx, valid_batch in enumerate(loader):
+    data, labels = valid_batch
+    valid_images = data.to(device)
+    valid_images_orig = torch.clone(valid_images)
+    optimizer = optim.Adam([valid_images], lr=learning_rate)
+    for epoch in range(num_epochs):
+      valid_images.requires_grad = True
+      optimizer.zero_grad()
+      output = backdoor_model(valid_images)
+      print(idx,epoch,torch.mean(output).item(),torch.min(output).item(),torch.sum(output<=0.0).item())
+      torch.sum(-output).backward()
+      optimizer.step()
+      valid_images.requires_grad = False
+      torch.fmax(torch.fmin(valid_images,torch.ones(1).to(device)),torch.zeros(1).to(device),out=valid_images)
+    output = backdoor_model(valid_images)
+    num_of_problem_images += torch.sum(output<=0.0).item()
+    print(idx,"after clamp",torch.mean(output).item(),torch.min(output).item(),torch.sum(output<=0.0).item(),num_of_problem_images)
+    if idx > 2 and (num_of_val_in_random_good_dicts < 100 or num_of_val_in_random_bad_dicts < 100) :
+      for i in range(valid_images.shape[0]) :
+        lab = labels[i].item()
+        if lab not in random_good_perturbations :
+          random_good_perturbations[lab] = []
+          random_good[lab] = []
+          random_good_dif[lab] = []
+          random_bad_perturbations[lab] = []
+          random_bad[lab] = []
+          random_bad_dif[lab] = []
+        if len(random_good_perturbations[lab]) < number_per_labs :
+          if output[i] <= 0 and num_of_val_in_random_bad_dicts < 100:
+            random_bad_perturbations[lab].append(valid_images[i].detach().cpu())
+            random_bad[lab].append(valid_images_orig[i].detach().cpu())
+            random_bad_dif[lab].append( ((valid_images[i].detach().cpu()-valid_images_orig[i].detach().cpu())*4)+0.5)
+            num_of_val_in_random_bad_dicts += 1
+          elif num_of_val_in_random_good_dicts < 100 :
+            random_good_perturbations[lab].append(valid_images[i].detach().cpu())
+            random_good[lab].append(valid_images_orig[i].detach().cpu())
+            random_good_dif[lab].append( ((valid_images[i].detach().cpu()-valid_images_orig[i].detach().cpu())*4)+0.5)
+            num_of_val_in_random_good_dicts += 1
+  save_image_block(random_good_perturbations,scenario+"random_good_perturbations")
+  save_image_block(random_good,scenario+"random_good")
+  save_image_block(random_good_dif,scenario+"random_good_dif")
+  save_image_block(random_bad_perturbations,scenario+"random_bad_perturbations")
+  save_image_block(random_bad,scenario+"random_bad")
+  save_image_block(random_bad_dif,scenario+"random_bad_dif")
 
 def train_model(stegano_net, train_loader, batch_size, valid_loader, scenario, threat_model, num_epochs, alpha, beta, epsilon_clip, learning_rate, device):
   # Save optimizer
@@ -915,7 +977,7 @@ def robust_test_model(backdoor_generator_model, backdoor_detect_model, robust_mo
 parser = ArgumentParser(description='Model evaluation')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default="cifar10")
-parser.add_argument('--data_path', type=str, default="data/")
+parser.add_argument('--data_path', type=str, default="../res/data/")
 parser.add_argument('--model', type=str, default="NOPE")
 parser.add_argument('--secret', type=str, default="NOPE")
 parser.add_argument('--mode', type=str, default="train_test")
@@ -1012,3 +1074,5 @@ if MODE.ATTACK.value in mode :
   robust_test_model(backdoor_generator_model=backdoor_generator_model, backdoor_detect_model=backdoor_detect_model, robust_model=robust_model, attack_name=attack_name, attack_scope=attack_scope, scenario=scenario, trials=trials, threat_model=robust_model_threat_model, test_loader=test_loader, batch_size=batch_size,  device=device, epsilon_clip=epsilon, specific_secret=best_secret, tau_threshold=tau_threshold, real_jpeg_q=real_jpeg_q, target_class=target_class)
 if MODE.RANDOM_ATTACK.value in mode :
   robust_random_attack(backdoor_detect_model,test_loader=test_loader,batch_size=batch_size,num_epochs=num_epochs,epsilon=epsilon,specific_secret=best_secret,threshold_range=threshold_range,device=device,threat_model=threat_model,scenario=scenario)
+if MODE.MAXIM_INPUT.value in mode :
+  maximazing_input(backdoor_detect_model=backdoor_detect_model,loader=test_loader,num_epochs=num_epochs,learning_rate=learning_rate,scenario=scenario,device=device,specific_secret=best_secret,tau_threshold=tau_threshold)
