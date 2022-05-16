@@ -16,13 +16,6 @@ from autoattack import AutoAttack
 from enum import Enum
 from io import BytesIO
 
-MODELS_PATH = '../res/models/'
-IMAGE_PATH = '../res/images/'
-SECRET_PATH = IMAGE_PATH+'cifar10_best_secret.png'
-IMAGENET_TRAIN = DATA_PATH+'imagenet-train'
-IMAGENET_TEST = DATA_PATH+'imagenet-test'
-TINY_IMAGENET_TRAIN = DATA_PATH+'tiny-imagenet-200/train'
-TINY_IMAGENET_TEST = DATA_PATH+'tiny-imagenet-200/val'
 
 class DATASET(Enum) :
   MNIST = 'mnist'
@@ -61,6 +54,56 @@ class ATTACK_NAME(Enum):
   APGD_CE = "apgd-ce"
   APGD_DLR = "apgd-dlr"
   APGD_DLR_T = "apgd-t"
+
+class ActivationExtractor(nn.Module):
+  def __init__(self, model: nn.Module, layers=None):
+    super().__init__()
+    self.model = model
+    if layers is None:
+      self.layers = []
+      for n, _ in model.named_modules():
+        self.layers.append(n)
+    else:
+      self.layers = layers
+    self.activations = {layer: torch.empty(0) for layer in self.layers}
+    self.hooks = []
+    self.layer_id_to_hooks_id = {}
+    hooks_id = 0
+    for layer_id in self.layers:
+      layer = dict([*self.model.named_modules()])[layer_id]
+      self.layer_id_to_hooks_id[layer_id] = hooks_id
+      self.hooks.append(layer.register_forward_hook(self.get_activation_hook(layer_id)))
+      hooks_id += 1
+
+  def get_activation_hook(self, layer_id: str):
+    def fn(_, __, output):
+      self.activations[layer_id] = output
+    return fn
+
+  def set_artificial_activation_hook(self, layer_id , image_id, channel_id, x_id, pixel_id, value_to_set) :
+    layer = dict([*self.model.named_modules()])[layer_id]
+    self.hooks[self.layer_id_to_hooks_id[layer_id]] = layer.register_forward_hook(self.artificial_activation_hook(layer_id , image_id, channel_id, x_id, pixel_id, value_to_set))
+
+  def artificial_activation_hook(self, layer_id , image_id, channel_id, x_id, pixel_id, value_to_set) :
+    def fn(hook_module, hook_input, hook_output):
+      print('HOOK_LAYER:', hook_module, layer_id, image_id, channel_id, x_id, pixel_id, value_to_set)
+      print('INPUT:', hook_input[0].size(), hook_input[0].size().numel(), hook_input[0].count_nonzero())
+      print('OUTPUT:', hook_output.size(), hook_output.size().numel(), hook_output.count_nonzero())
+      hook_output[image_id][channel_id][x_id][pixel_id] = value_to_set
+      self.activations[layer_id] = hook_output
+      print('OUTPUT AFTER ACTIVATION IS ADDED:', hook_output.size(), hook_output.size().numel(), hook_output.count_nonzero())
+      return hook_output
+    return fn
+
+
+  def remove_hooks(self):
+    for hook in self.hooks:
+      hook.remove()
+
+  def forward(self, x):
+    self.model(x)
+    return self.activations
+
 
 image_shape = {}
 val_size = {}
@@ -231,7 +274,7 @@ def save_image_block(image_block_dict, filename_postfix, format="png", jpeg_qual
   else :
     save_image(image_block,filename_postfix)
 
-def open_secret(path=SECRET_PATH) :
+def open_secret(path) :
   loader = transforms.Compose([transforms.ToTensor()])
   opened_image = Image.open(os.path.join(IMAGE_PATH, path)).convert('L')
   opened_image_tensor = loader(opened_image).unsqueeze(0)
@@ -374,6 +417,92 @@ def maximazing_input(backdoor_detect_model, loader, num_epochs, learning_rate, s
   save_image_block(random_bad_perturbations,scenario+"random_bad_perturbations")
   save_image_block(random_bad,scenario+"random_bad")
   save_image_block(random_bad_dif,scenario+"random_bad_dif")
+
+def activation_evaluation_with_turn_nuerons_on(backdoor_generator_model, backdoor_detect_model, loader, scenario, device, specific_secret, tau_threshold, real_jpeg_q, target_class):
+  secret = create_batch_from_a_single_image(specific_secret,batch_size).to(device)
+  backdoor_model = ThresholdedBackdoorDetectorStegano(backdoor_detect_model,specific_secret.to(device),tau_threshold,device)
+  activations_mean = {}
+  activations_after_mean = {}
+  activations_backdoor_mean = {}
+  with torch.no_grad():
+    for idx, test_batch in enumerate(loader):
+      data, labels = test_batch
+      test_images = data.to(device)
+      extractor = ActivationExtractor(backdoor_model, ThresholdedBackdoorDetectorStegano.get_relevant_layers())
+      activations = extractor(test_images)
+      extractor.remove_hooks()
+      zero_activation_neurons = {}
+      for key in activations :
+        activations_this = torch.clone(activations[key].detach().cpu())
+        if 'detector' in key :
+          activation_number_this_normal = (torch.sum(torch.sum(activations_this == 0, dim=(2,3)) == 1024, dim=0)/test_images.shape[0]).unsqueeze(0)
+          i_image = 0
+          for image in activations_this :
+            i_channel = 0
+            for channel in  image :
+              i_x_axis = 0
+              for x_axis in channel :
+                i_pixel = 0
+                for pixel in x_axis :
+                  if pixel == 0 :
+                    if key not in zero_activation_neurons :
+                      zero_activation_neurons[key] = {}
+                    if i_image not in zero_activation_neurons[key] :
+                      zero_activation_neurons[key][i_image] = {}
+                    if i_channel not in zero_activation_neurons[key][i_image] :
+                      zero_activation_neurons[key][i_image][i_channel] = {}
+                    if i_x_axis not in zero_activation_neurons[key][i_image][i_channel] :
+                      zero_activation_neurons[key][i_image][i_channel][i_x_axis] = {}
+                    zero_activation_neurons[key][i_image][i_channel][i_x_axis][i_pixel] = 1
+                    extractor_for_set_artificial_activation_hook = ActivationExtractor(backdoor_model, ThresholdedBackdoorDetectorStegano.get_relevant_layers())
+                    extractor_for_set_artificial_activation_hook.set_artificial_activation_hook(key,i_image,i_channel,i_x_axis,i_pixel,1)
+                    new_activations = extractor_for_set_artificial_activation_hook(test_images)
+                    num_of_activ = 0
+                    for new_key in new_activations :
+                      new_activations_this = torch.clone(new_activations[new_key].detach().cpu())
+                      if 'detector' in new_key :
+                        new_activation_number_this_normal = torch.sum(new_activations_this == 0, dim=(1, 2, 3))
+                      elif len(new_activations_this.shape) > 1:
+                        new_activation_number_this_normal = torch.sum(new_activations_this == 0, dim=1)
+                      else :
+                        new_activation_number_this_normal = torch.sum(new_activations_this.unsqueeze(1) == 0, dim=1)
+                      if new_key not in activations_after_mean :
+                        activations_after_mean[new_key] = new_activation_number_this_normal
+                      else :
+                        activations_after_mean[new_key] = torch.cat((activations_after_mean[key], new_activation_number_this_normal),dim=0)
+                      num_of_activ += torch.mean(torch.Tensor.float(new_activation_number_this_normal)).item()
+                    print(num_of_activ)
+                    extractor_for_set_artificial_activation_hook.remove_hooks()
+                  i_pixel += 1
+                i_x_axis += 1
+              i_channel += 1
+            i_image += 1
+        else :
+          activation_number_this_normal = (torch.sum(activations_this == 0, dim=(0))/test_images.shape[0]).unsqueeze(0)
+        if key not in activations_mean :
+          activations_mean[key] = activation_number_this_normal
+        else :
+          activations_mean[key] = torch.cat((activations_mean[key], activation_number_this_normal),dim=0)
+
+      backdoored_image = backdoor_generator_model(secret,test_images)
+      extractor = ActivationExtractor(backdoor_model, ThresholdedBackdoorDetectorStegano.get_relevant_layers())
+      activations = extractor(backdoored_image)
+      extractor.remove_hooks()
+      for key in activations :
+        if 'detector' in key :
+          activations_this = (torch.sum(torch.sum(torch.clone(activations[key].detach().cpu()) == 0, dim=(2,3)) == 1024, dim=0)/test_images.shape[0]).unsqueeze(0)
+        else :
+          activations_this = (torch.sum(torch.clone(activations[key].detach().cpu()) == 0, dim=(0))/test_images.shape[0]).unsqueeze(0)
+        if key not in activations_backdoor_mean :
+          activations_backdoor_mean[key] = activations_this
+        else :
+          activations_backdoor_mean[key] = torch.cat((activations_backdoor_mean[key], activations_this),dim=0)
+  for key in activations_mean :
+    print(torch.mean(activations_mean[key],dim=0),torch.sum(torch.mean(activations_mean[key],dim=0)))
+  for key in activations_after_mean :
+    print(torch.mean(activations_after_mean[key],dim=0),torch.sum(torch.mean(activations_after_mean[key],dim=0)))
+  for key in activations_backdoor_mean :
+    print(torch.mean(activations_backdoor_mean[key],dim=0),torch.sum(torch.mean(activations_backdoor_mean[key],dim=0)))
 
 def train_model(stegano_net, train_loader, batch_size, valid_loader, scenario, threat_model, num_epochs, alpha, beta, epsilon_clip, learning_rate, device):
   # Save optimizer
@@ -1009,6 +1138,13 @@ parser.add_argument('--num_secret_on_test', type=int, default=1000)
 params = parser.parse_args()
 
 DATA_PATH = params.data_path
+MODELS_PATH = '../res/models/'
+IMAGE_PATH = '../res/images/'
+SECRET_PATH = IMAGE_PATH+'cifar10_best_secret.png'
+IMAGENET_TRAIN = DATA_PATH+'imagenet-train'
+IMAGENET_TEST = DATA_PATH+'imagenet-test'
+TINY_IMAGENET_TRAIN = DATA_PATH+'tiny-imagenet-200/train'
+TINY_IMAGENET_TEST = DATA_PATH+'tiny-imagenet-200/val'
 
 # Other Parameters
 device = torch.device('cuda:'+str(params.gpu))
@@ -1076,3 +1212,5 @@ if MODE.RANDOM_ATTACK.value in mode :
   robust_random_attack(backdoor_detect_model,test_loader=test_loader,batch_size=batch_size,num_epochs=num_epochs,epsilon=epsilon,specific_secret=best_secret,threshold_range=threshold_range,device=device,threat_model=threat_model,scenario=scenario)
 if MODE.MAXIM_INPUT.value in mode :
   maximazing_input(backdoor_detect_model=backdoor_detect_model,loader=test_loader,num_epochs=num_epochs,learning_rate=learning_rate,scenario=scenario,device=device,specific_secret=best_secret,tau_threshold=tau_threshold)
+if MODE.ACTIVATION_EVAL_ARTIFICIAL.value in mode :
+  activation_evaluation_with_turn_nuerons_on(backdoor_generator_model, backdoor_detect_model, test_loader, scenario, device, specific_secret=best_secret, tau_threshold=tau_threshold, real_jpeg_q=real_jpeg_q, target_class=target_class)
