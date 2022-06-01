@@ -1,6 +1,9 @@
 from argparse import ArgumentParser
 import robustbench as rb
+import sys
 import torch
+import torch.nn as nn
+from tqdm import tqdm
 from torch.utils.data import random_split
 import torchvision
 import torchvision.transforms as transforms
@@ -65,16 +68,126 @@ def get_loaders(dataset_name, batchsize):
 
   return train_loader, val_loader, test_loader
 
+class ActivationExtractor(nn.Module):
+  def __init__(self, model: nn.Module, layers=None, activated_layers=None, activation_value=1):
+    super().__init__()
+    self.model = model
+    if layers is None:
+      self.layers = []
+      for n, _ in model.named_modules():
+        self.layers.append(n)
+    else:
+      self.layers = layers
+    self.activations = {layer: torch.empty(0) for layer in self.layers}
+    self.activated_layers = activated_layers
+    self.activation_value = activation_value
+
+    self.hooks = []
+
+    for layer_id in self.layers:
+      layer = dict([*self.model.named_modules()])[layer_id]
+      self.hooks.append(layer.register_forward_hook(self.get_activation_hook(layer_id)))
+
+  def get_activation_hook(self, layer_id: str):
+    def fn(_, __, output):
+      # self.activations[layer_id] = output.detach().clone()
+      self.activations[layer_id] = output
+      if self.activated_layers is not None and layer_id in self.activated_layers:
+        for idx in self.activated_layers[layer_id]:
+          for sample_idx in range(0, output.size()[0]):
+            output[tuple(torch.cat((torch.tensor([sample_idx]).to(idx.device), idx)))] = self.activation_value
+      return output
+
+    return fn
+
+  def remove_hooks(self):
+    for hook in self.hooks:
+      hook.remove()
+
+  def forward(self, x):
+    self.model(x)
+    return self.activations
+
+def filter_out(x, y, label=-1):
+  indices = y != label
+  return x[indices], y[indices]
+
+def get_activations(model, data_loader, label, device, activated_layers=None):
+  acc=.0
+  count=0
+  model.eval()
+  model.to(device)
+  #ae = AE(model, [name for name, _ in model.named_modules() if name != ''])
+  ae = ActivationExtractor(model, activated_layers=activated_layers)
+  activations = {}
+  with torch.no_grad():
+    for data in tqdm(data_loader, file=sys.stderr):
+      x = data[0].to(device)
+      y = data[1].to(device)
+      x, y = filter_out(x, y, label)
+      p = model(x)
+      acc += sum(p.argmax(1)==y)
+      count += x.size()[0]
+      for aid in ae.activations:
+        if not aid in activations:
+          activations[aid] = (ae.activations[aid] * 0.).sum(0)
+        activations[aid] += ae.activations[aid].sum(0)
+  ae.remove_hooks()
+  return (acc/count).item(), activations
+
+
+def count_zeros(act):
+  count = 0
+  for aid in act:
+    count += act[aid].numel() - act[aid].count_nonzero()
+  return count
+
+def activation_diff(act_a, act_b):
+  count = 0
+  indices = {}
+  for aid in act_a:
+    xors = torch.logical_xor(act_a[aid] == 0, act_b[aid] == 0)
+    for idx in xors.nonzero():
+      if aid not in indices:
+        indices[aid] = []
+      indices[aid].append(idx)
+      # print(aid, idx, xors.size())#, xors[tuple(idx)])
+    count += xors.count_nonzero()
+  return count, indices
+
+
+def test_labels_activations(model, data_loader, label_a, label_bs, device):
+  accuracy_a, activations_a = get_activations(model, data_loader, label_a, device)
+  print(label_a, 'ZEROS:', count_zeros(activations_a), 'ACCURACY:', accuracy_a)
+
+  for label_b in label_bs:
+    print('TESTING LABEL:', label_b)
+    accuracy_b, activations_b = get_activations(model, data_loader, label_b, device)
+    diffc, diffs = activation_diff(activations_a, activations_b)
+    print(label_b, 'ZEROS:', count_zeros(activations_b), 'ACCURACY:', accuracy_b)
+    print('ACTIVATION DIFFS:', diffc, diffs)
+    for layer_name in diffs:
+      for idx in diffs[layer_name]:
+        accuracy_b, activations_b = get_activations(model, data_loader, label_b, device, {layer_name: [idx]})
+        dc, ds = activation_diff(activations_a, activations_b)
+        print('  set to 1:', layer_name, idx)
+        print('  num zero:', count_zeros(activations_b), 'acc:', accuracy_b)
+        print('   a-diffs:', dc, ds)
+        print('   0-DIFFS:', diffc - dc)
+        # exit(0)
+
 parser = ArgumentParser(description='Model evaluation')
 parser.add_argument('--gpu', type=int, default=0)
-parser.add_argument('--dataset', type=str, default="cifar10")
+parser.add_argument('--dataset', type=str, default="imagenet")
 parser.add_argument('--data_path', type=str, default="../res/data/")
 parser.add_argument('--model', type=str, default="NOPE")
-parser.add_argument("--robust_model", type=str , default="Gowal2020Uncovering_28_10_extra")
+parser.add_argument("--robust_model", type=str , default="Salman2020Do_R18")
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--epochs', type=int, default=20)
 parser.add_argument('--learning_rate', type=float, default=0.0001)
 parser.add_argument("--threat_model", type=str , default="Linf")
+parser.add_argument('--base_class', type=int, default=-1, help='target class activations are compared to this class, -1 means all classes')
+parser.add_argument('--target_classes', type=int, nargs='+', default=[i for i in range(-1, 1000)], help='target classes to be compared')
 
 params = parser.parse_args()
 
@@ -100,4 +213,9 @@ if threat_model == "Linfinity" :
   robust_model_threat_model = "Linf"
 else :
   robust_model_threat_model = threat_model
-model = rb.load_model(model_name=params.robust_model, dataset=dataset, threat_model=threat_model).to(device)
+robust_model_name = params.robust_model
+model = rb.load_model(model_name=robust_model_name, dataset=dataset, threat_model=threat_model).to(device)
+label_a = params.base_class
+label_bs = params.target_classes
+data_loader = val_loader
+test_labels_activations(model, data_loader, label_a, label_bs, device)
