@@ -116,7 +116,7 @@ class ActivationExtractor(nn.Module):
     return self.activations
 
 
-def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, feature_idx_list = None, verbose_null=True) :
+def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, feature_idx_list = None, verbose_null=True, grayscaled=False) :
   reach_the_goal = False
   prev_activ_sum = 0
   rec_activ_sum = 0
@@ -127,34 +127,67 @@ def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_clas
     if "robustness" in robust_model_name:
       output = output[0]
     pred = torch.nn.functional.softmax(output, dim=1)
-    output = output[0][index_of_decipher_class]
+
     if epoch == 0 and verbose_null:
       save_image(image[0], str(idx) + "_0_" + str(pred[0][index_of_decipher_class].item() * 100))
+    pred[0][index_of_decipher_class] = 0
+    max_pred_idx_for_logit_margin = torch.argmax(pred[0])
+    second_output = output[0][max_pred_idx_for_logit_margin]
+    output = output[0][index_of_decipher_class]
     if feature_idx_list is None :
       print(idx, epoch, output.item(), pred[0][index_of_decipher_class].item() * 100, end=" ")
-      (-output).backward()
+      (-output + second_output).backward()
     else :
       for feature_idx in feature_idx_list :
         activation_extractor.activations['model.avgpool'][0, :, 0, 0][feature_idx] = 0
       print(idx, epoch, output.item(), torch.sum(torch.square(activation_extractor.activations['model.avgpool'][0, :, 0, 0])).item(), pred[0][index_of_decipher_class].item() * 100, alpha, end=" ")
       rec_activ_sum = torch.sum(torch.square(activation_extractor.activations['model.avgpool'][0, :, 0, 0]))
-      (-output + alpha * rec_activ_sum).backward()
+      (-output + second_output + alpha * rec_activ_sum).backward()
     optimizer.step()
     image.requires_grad = False
     torch.fmax(torch.fmin(image, torch.ones(1).to(device)), torch.zeros(1).to(device), out=image)
+    if grayscaled :
+      image[0][1] = image[0][0]
+      image[0][2] = image[0][0]
     output = model(image)
     if "robustness" in robust_model_name:
       output = output[0]
     pred = torch.nn.functional.softmax(output, dim=1)
     output = output[0][index_of_decipher_class]
-    if pred[0][index_of_decipher_class].item() > 0.99 and prev_activ_sum < rec_activ_sum :
-      alpha += 0.001
+    if pred[0][index_of_decipher_class].item() > 0.5 and prev_activ_sum < rec_activ_sum :
+      alpha += 0.01
       reach_the_goal = True
-    elif pred[0][index_of_decipher_class].item() < 0.99 and reach_the_goal:
-      alpha -= 0.0001
+    elif pred[0][index_of_decipher_class].item() < 0.5 and reach_the_goal:
+      alpha -= 0.001
     prev_activ_sum = rec_activ_sum
     print("after clamp:", output.item(), pred[0][index_of_decipher_class].item() * 100)
   return pred, image
+
+def maximazing_grayscale_input_scenario(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
+  for param in model.parameters():
+    param.requires_grad = False
+  model.eval()
+  activation_extractor = ActivationExtractor(model, ["model.avgpool"])
+  rand_imgage = torch.rand((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
+  rand_imgage[0][1] = rand_imgage[0][0]
+  rand_imgage[0][2] = rand_imgage[0][0]
+  black_image = torch.zeros((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  black_image[0][1] = black_image[0][0]
+  black_image[0][2] = black_image[0][0]
+  gray_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  gray_image *= 0.5
+  gray_image[0][1] = gray_image[0][0]
+  gray_image[0][2] = gray_image[0][0]
+  white_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  white_image[0][1] = white_image[0][0]
+  white_image[0][2] = white_image[0][0]
+  images = [rand_imgage, black_image, gray_image, white_image]
+  idx = 0
+  for image in images:
+    optimizer = optim.Adam([image], lr=learning_rate)
+    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, grayscaled=True)
+    save_image(ret_image[0],str(idx)+"_100_all_"+str(pred[0][index_of_decipher_class].item()*100))
+    idx += 1
 
 def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
   for param in model.parameters():
