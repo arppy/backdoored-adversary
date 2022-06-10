@@ -76,11 +76,11 @@ def save_image(image, filename_postfix, quality=80) :
   if color_channel[dataset_name] == 1 :
     denormalized_images = np.uint8(denormalized_images.detach().cpu().numpy())
     img = Image.fromarray(denormalized_images[0], "L")
-    img.save(os.path.join(IMAGE_PATH, filename_postfix + ".jpg"), format='JPEG', quality=quality)
+    img.save(os.path.join(IMAGE_PATH, "sources", filename_postfix + ".jpg"), format='JPEG', quality=quality)
   elif color_channel[dataset_name] == 3:
     tensor_to_image = transforms.ToPILImage()
     img = tensor_to_image(denormalized_images)
-    img.save(os.path.join(IMAGE_PATH, filename_postfix +  ".jpg"), format='JPEG', quality=quality)
+    img.save(os.path.join(IMAGE_PATH, "sources", filename_postfix +  ".jpg"), format='JPEG', quality=quality)
 
 class ActivationExtractor(nn.Module):
   def __init__(self, model: nn.Module, layers=None):
@@ -116,7 +116,7 @@ class ActivationExtractor(nn.Module):
     return self.activations
 
 
-def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, feature_idx_list = None, verbose_null=True, grayscaled=False) :
+def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, alpha = 0.02, feature_idx_list = None, verbose_null=True, grayscaled=False, logits_margin=True) :
   reach_the_goal = False
   prev_activ_sum = 0
   rec_activ_sum = 0
@@ -127,7 +127,6 @@ def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_clas
     if "robustness" in robust_model_name:
       output = output[0]
     pred = torch.nn.functional.softmax(output, dim=1)
-
     if epoch == 0 and verbose_null:
       save_image(image[0], str(idx) + "_0_" + str(pred[0][index_of_decipher_class].item() * 100))
     pred[0][index_of_decipher_class] = 0
@@ -136,13 +135,19 @@ def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_clas
     output = output[0][index_of_decipher_class]
     if feature_idx_list is None :
       print(idx, epoch, output.item(), pred[0][index_of_decipher_class].item() * 100, end=" ")
-      (-output + second_output).backward()
+      if logits_margin :
+        (-output + second_output).backward()
+      else :
+        (-output).backward()
     else :
       for feature_idx in feature_idx_list :
         activation_extractor.activations['model.avgpool'][0, :, 0, 0][feature_idx] = 0
       print(idx, epoch, output.item(), torch.sum(torch.square(activation_extractor.activations['model.avgpool'][0, :, 0, 0])).item(), pred[0][index_of_decipher_class].item() * 100, alpha, end=" ")
       rec_activ_sum = torch.sum(torch.square(activation_extractor.activations['model.avgpool'][0, :, 0, 0]))
-      (-output + second_output + alpha * rec_activ_sum).backward()
+      if logits_margin:
+        (-output + second_output + alpha * rec_activ_sum).backward()
+      else :
+        (-output + alpha * rec_activ_sum).backward()
     optimizer.step()
     image.requires_grad = False
     torch.fmax(torch.fmin(image, torch.ones(1).to(device)), torch.zeros(1).to(device), out=image)
@@ -163,6 +168,64 @@ def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_clas
     print("after clamp:", output.item(), pred[0][index_of_decipher_class].item() * 100)
   return pred, image
 
+def diff_activations_of_images(model,device,index_of_decipher_class) :
+  for param in model.parameters():
+    param.requires_grad = False
+  model.eval()
+  activation_extractor = ActivationExtractor(model, ["model.maxpool","model.layer1.0.relu", "model.layer1.0.bn2",
+                                                     "model.layer1.1.relu", "model.layer1.1.bn2",
+                                                     "model.layer2.0.relu", "model.layer2.0.downsample.1",
+                                                     "model.layer2.1.relu", "model.layer2.1.bn2",
+                                                     "model.layer3.0.relu", "model.layer3.0.downsample.1",
+                                                     "model.layer3.1.relu", "model.layer3.1.bn2",
+                                                     "model.layer4.0.relu", "model.layer4.0.downsample.1",
+                                                     "model.layer4.1.relu", "model.layer4.1.bn2",
+                                                     "model.avgpool", "model.fc"])
+
+  jelly_blue_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image[0][0] *= 7/255
+  jelly_blue_image[0][1] *= 36/255
+  jelly_blue_image2 = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image2[0][0] *= 14/255
+  jelly_blue_image2[0][1] *= 41/255
+  #jelly_magenta_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  #jelly_magenta_image[0][0] *= 199/255
+  #jelly_magenta_image[0][1] *= 0/255
+  #jelly_magenta_image[0][2] *= 140/255
+  loader = transforms.Compose([transforms.ToTensor()])
+  jelly_magenta_image = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "magenta_jelly_99_99.jpg")).convert('RGB')
+  jelly_magenta_image = loader(jelly_magenta_image).unsqueeze(0).to(device)
+  explain5_jelly = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "explain5_jelly.png")).convert('RGB')
+  explain5_jelly = loader(explain5_jelly).unsqueeze(0).to(device)
+  gray_jelly_logits_99_87 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "gray_jelly_logits_99_87.jpg")).convert('RGB')
+  gray_jelly_logits_99_87 = loader(gray_jelly_logits_99_87).unsqueeze(0).to(device)
+  gray_jelly_logits_margin_99_95 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "gray_jelly_logits_margin_99_95.jpg")).convert('RGB')
+  gray_jelly_logits_margin_99_95 = loader(gray_jelly_logits_margin_99_95).unsqueeze(0).to(device)
+  gray_jelly_logits_margin_99_99 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "gray_jelly_logits_margin_99_99.jpg")).convert('RGB')
+  gray_jelly_logits_margin_99_99 = loader(gray_jelly_logits_margin_99_99).unsqueeze(0).to(device)
+  toyshop_99_93 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "toyshop_99_93.jpg")).convert('RGB')
+  toyshop_99_93 = loader(toyshop_99_93).unsqueeze(0).to(device)
+  loader = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor()])
+  n01910747_654 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "n01910747_654.JPEG")).convert('RGB')
+  n01910747_654 = loader(n01910747_654).unsqueeze(0).to(device)
+  images = [jelly_blue_image, jelly_blue_image2, jelly_magenta_image, explain5_jelly, gray_jelly_logits_99_87, gray_jelly_logits_margin_99_95, gray_jelly_logits_margin_99_99, n01910747_654, toyshop_99_93]
+  idx = 0
+  activations_arr = []
+  for image in images:
+    output = model(image)
+    activations_arr.append(activation_extractor.activations.copy())
+    idx += 1
+  #diff1_2 = torch.where(torch.round(activations_arr[1]['model.avgpool'][0, :, 0, 0] * 255) == torch.round(activations_arr[2]['model.avgpool'][0, :, 0, 0] * 255))[0].cpu().numpy()
+  #diff0_1 = torch.where(torch.round(activations_arr[0]['model.avgpool'][0, :, 0, 0] * 255) == torch.round(activations_arr[1]['model.avgpool'][0, :, 0, 0] * 255))[0].cpu().numpy()
+  similiraty_matrix = []
+  for i in range(len(activations_arr)) :
+    similiraty_matrix.append([])
+    for j in range(len(activations_arr)) :
+      i_th_activations = activations_arr[i]['model.avgpool'][0, :, 0, 0]
+      j_th_activations = activations_arr[j]['model.avgpool'][0, :, 0, 0]
+      cossim = nn.functional.cosine_similarity(i_th_activations,j_th_activations,dim=0)
+      similiraty_matrix[i].append(cossim.item())
+
 def maximazing_grayscale_input_scenario(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
   for param in model.parameters():
     param.requires_grad = False
@@ -181,15 +244,53 @@ def maximazing_grayscale_input_scenario(model, loader, num_of_images, num_epochs
   white_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
   white_image[0][1] = white_image[0][0]
   white_image[0][2] = white_image[0][0]
-  images = [rand_imgage, black_image, gray_image, white_image]
+  loader = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor()])
+  n01910747_654 = Image.open(os.path.join(IMAGE_PATH, "jellyfish", "n01910747_654.JPEG")).convert('RGB')
+  n01910747_654 = loader(n01910747_654).unsqueeze(0).to(device)
+  images = [rand_imgage, black_image, gray_image, white_image, n01910747_654]
   idx = 0
   for image in images:
     optimizer = optim.Adam([image], lr=learning_rate)
-    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, grayscaled=True)
+    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, alpha=alpha, grayscaled=True, logits_margin=True)
     save_image(ret_image[0],str(idx)+"_100_all_"+str(pred[0][index_of_decipher_class].item()*100))
     idx += 1
 
-def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
+def maximazing_input_scenario_all_feature(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class):
+  for param in model.parameters():
+    param.requires_grad = False
+  model.eval()
+  activation_extractor = ActivationExtractor(model, ["model.avgpool"])
+  rand_imgage = torch.rand((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  black_image = torch.zeros((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  gray_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  gray_image *= 0.5
+  white_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image[0][0] *= 7/255
+  jelly_blue_image[0][1] *= 36/255
+  jelly_blue_image2 = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image2[0][0] *= 14/255
+  jelly_blue_image2[0][1] *= 41/255
+  jelly_magenta_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_magenta_image[0][0] *= 199/255
+  jelly_magenta_image[0][1] *= 0/255
+  jelly_magenta_image[0][2] *= 140/255
+  images = [rand_imgage,black_image,gray_image,white_image]
+  if num_of_images > len(images) :
+    for i in range(0,num_of_images-len(images)) :
+      color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
+      for c in range(0,3) :
+        color_image[0,c] *= torch.rand(1).item()
+      images.append(color_image)
+  idx = 0
+  for image in images:
+    optimizer = optim.Adam([image], lr=learning_rate)
+    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx)
+    save_image(ret_image[0],str(idx)+"_100_all_"+str(pred[0][index_of_decipher_class].item()*100))
+    idx += 1
+
+
+def maximazing_input_scenario_some_feature(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
   for param in model.parameters():
     param.requires_grad = False
   model.eval()
@@ -213,9 +314,16 @@ def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning
   gray_image *= 0.5
   white_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
   jelly_blue_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
-  jelly_blue_image[0][0] *= 0.0
-  jelly_blue_image[0][1] *= 0.0
-  images = [rand_imgage,black_image,gray_image,white_image,jelly_blue_image]
+  jelly_blue_image[0][0] *= 7/255
+  jelly_blue_image[0][1] *= 36/255
+  jelly_blue_image2 = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_blue_image2[0][0] *= 14/255
+  jelly_blue_image2[0][1] *= 41/255
+  jelly_magenta_image = torch.ones((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
+  jelly_magenta_image[0][0] *= 199/255
+  jelly_magenta_image[0][1] *= 0/255
+  jelly_magenta_image[0][2] *= 140/255
+  images = [rand_imgage,black_image,gray_image,white_image]
   if num_of_images > 5 :
     for i in range(0,num_of_images-5) :
       color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
@@ -226,7 +334,7 @@ def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning
   for image in images:
     optimizer = optim.Adam([image], lr=learning_rate)
     original_image = torch.clone(image)
-    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx)
+    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, alpha=alpha)
     save_image(ret_image[0],str(idx)+"_100_all_"+str(pred[0][index_of_decipher_class].item()*100))
     saved_model_weigths = torch.clone(model[1]._modules['fc'].weight[index_of_decipher_class])
     for avgpool_neuron_index in avgpool_neuron_top3.indices:
@@ -235,7 +343,7 @@ def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning
       #model[1]._modules['fc'].weight[index_of_decipher_class] = torch.zeros(saved_model_weigths.shape, device=device)
       #model[1]._modules['fc'].weight[index_of_decipher_class][saved_model_weigths < 0] = torch.zeros(saved_model_weigths[saved_model_weigths < 0].shape, device=device)
       #model[1]._modules['fc'].weight[index_of_decipher_class][avgpool_neuron_index.item()] = saved_model_weigths[avgpool_neuron_index.item()]
-      pred, ret_image = maximazing_input(model, next_image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, feature_idx_list=[avgpool_neuron_index.item()], verbose_null=False)
+      pred, ret_image = maximazing_input(model, next_image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, alpha=alpha, feature_idx_list=[avgpool_neuron_index.item()], verbose_null=False)
       #model[1]._modules['fc'].weight[index_of_decipher_class] = saved_model_weigths
       output = model(ret_image)
       if "robustness" in robust_model_name:
@@ -250,7 +358,7 @@ def maximazing_input_scenario(model, loader, num_of_images, num_epochs, learning
     for feature_i in range(0, num_of_feature):
       #model[1]._modules['fc'].weight[index_of_decipher_class][avgpool_neuron_top3.indices[feature_i].item()] = saved_model_weigths[avgpool_neuron_top3.indices[feature_i].item()]
       feature_idx_list.append(avgpool_neuron_top3.indices[feature_i].item())
-    pred, ret_image = maximazing_input(model, next_image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, alpha, idx, feature_idx_list=feature_idx_list, verbose_null=False)
+    pred, ret_image = maximazing_input(model, next_image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, alpha=alpha, feature_idx_list=feature_idx_list, verbose_null=False)
     #model[1]._modules['fc'].weight[index_of_decipher_class] = saved_model_weigths
     output = model(ret_image)
     if "robustness" in robust_model_name:
