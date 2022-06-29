@@ -177,7 +177,7 @@ def get_distribution_of_confidences(model, loader, index_of_decipher_class) :
   else :
     print(0)
 
-def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, early_stopping_mean=None, early_stopping_max=None, verbose_null=True) :
+def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, early_stopping_mean=None, early_stopping_max=None, verbose_null=True) :
   optimizer = optim.Adam([images], lr=learning_rate)
   preda = []
   imagesa = []
@@ -276,7 +276,7 @@ def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bell
         color_image[0,c] *= torch.rand(1).item()
       images_a.append(color_image)
   images = torch.cat(images_a, 0)
-  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, 0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
   #i = len(ret_images_a) - 1
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])
