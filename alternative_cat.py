@@ -7,7 +7,6 @@ import os
 import torch
 import torch.optim as optim
 import torch.nn as nn
-from torch.utils.data import random_split
 import torchvision
 import torchvision.transforms as transforms
 from enum import Enum
@@ -179,6 +178,7 @@ def get_distribution_of_confidences(model, loader, index_of_decipher_class) :
     print(0)
 
 def maximazing_multiple_input(model, images, optimizer, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, early_stopping_mean=None, early_stopping_max=None, verbose_null=True) :
+  optimizer = optim.Adam([images], lr=learning_rate)
   preda = []
   imagesa = []
   epocha = []
@@ -252,6 +252,42 @@ def maximazing_multiple_input(model, images, optimizer, num_epochs, index_of_dec
       imagesa.append(images)
       epocha.append(epoch)
   return preda, imagesa, epocha
+
+def maximazing_input_at_same_time_by_cossim_scenario(model, num_of_images, num_epochs, device, index_of_decipher_class, alpha, cosine_sim_mode, early_stopping_mean, early_stopping_max):
+  for param in model.parameters():
+    param.requires_grad = False
+  model.eval()
+  activation_extractor = ActivationExtractor(model, ["model.avgpool"])
+  images_a = []
+  if num_of_images > len(images_a) :
+    for i in range(0,num_of_images-len(images_a)) :
+      color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
+      for c in range(0,3) :
+        color_image[0,c] *= torch.rand(1).item()
+      images_a.append(color_image)
+  images = torch.cat(images_a, 0)
+  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, num_epochs, index_of_decipher_class, activation_extractor, 0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+  #i = len(ret_images_a) - 1
+  for i in range(len(ret_images_a)) :
+    output = model(ret_images_a[i])
+    activations = activation_extractor.activations['model.avgpool'][:, :, 0, 0]*model[1]._modules['fc'].weight[index_of_decipher_class]
+    cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
+    idx_ij = 0
+    for act_i in range(len(activations)):
+      for act_j in range(act_i + 1, len(activations)):
+        cossim_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
+        cosine_sim_aggregate[idx_ij] = cossim_ij
+        idx_ij += 1
+    if cosine_sim_mode == COSINE_SIM_MODE.max.value:
+      cosine_sim = torch.max(cosine_sim_aggregate)
+    elif cosine_sim_mode == COSINE_SIM_MODE.sum_square.value:
+      cosine_sim = cosine_sim_aggregate + 1
+      cosine_sim = torch.sum(torch.square(cosine_sim))
+    else:
+      cosine_sim = torch.sum(cosine_sim_aggregate)
+    for act_i in range(len(activations)):
+      save_image(ret_images_a[i][act_i],str(act_i)+"_"+str(i)+"_"+str(epoch_a[i])+"_all_"+str(torch.max(cosine_sim_aggregate).item())[0:6]+"_"+str(pred_a[i][act_i,index_of_decipher_class].item()*100)[0:6])
+
 
 def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, reference_images = None, alpha = 0.02, feature_idx_list = None, verbose_null=True, grayscaled=False, logits_margin=True, early_stopping = False) :
   reach_the_goal = False
@@ -394,8 +430,7 @@ def maximazing_input_at_same_time_by_cossim_scenario(model, num_of_images, loade
         color_image[0,c] *= torch.rand(1).item()
       images_a.append(color_image)
   images = torch.cat(images_a, 0)
-  optimizer = optim.Adam([images], lr=learning_rate)
-  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, optimizer, num_epochs, index_of_decipher_class, activation_extractor, 0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, num_epochs, index_of_decipher_class, activation_extractor, 0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
   #i = len(ret_images_a) - 1
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])

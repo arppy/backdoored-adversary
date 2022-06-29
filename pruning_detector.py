@@ -188,6 +188,8 @@ parser.add_argument('--learning_rate', type=float, default=0.0001)
 parser.add_argument("--threat_model", type=str , default="Linf")
 parser.add_argument('--base_class', type=int, default=-1, help='target class activations are compared to this class, -1 means all classes')
 parser.add_argument('--target_classes', type=int, nargs='+', default=[i for i in range(-1, 1000)], help='target classes to be compared')
+parser.add_argument('--early_stopping_mean', type=float, default=0.70)
+parser.add_argument('--early_stopping_max', type=float, default=0.9999)
 
 params = parser.parse_args()
 
