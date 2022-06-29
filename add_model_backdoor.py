@@ -230,8 +230,14 @@ def test_target_task(model,test_loader, target_class, device) :
       acc.append((torch.sum(torch.argmax(pred, dim=1) == labels) / pred.shape[0]).item())
   return np.mean(acc)
 
-def maximazing_input_at_same_time_by_cossim_scenario_this(model, num_of_images, num_epochs, device, target_class, alpha, cosine_sim_mode, early_stopping_mean, early_stopping_max) :
-  maximazing_input_at_same_time_by_cossim_scenario(model=model, num_of_images=num_of_images, num_epochs=num_epochs, device=device, index_of_decipher_class=target_class, alpha=alpha, cosine_sim_mode=cosine_sim_mode, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+def maximazing_input_at_same_time_by_cossim_scenario_this(model, num_of_images, last_layer_name_bellow_logits,
+                                                          logit_layer_name, num_epochs, device, target_class, alpha,
+                                                          cosine_sim_mode, early_stopping_mean, early_stopping_max) :
+  maximazing_input_at_same_time_by_cossim_scenario(model=model, num_of_images=num_of_images,
+                                                   last_layer_name_bellow_logits=last_layer_name_bellow_logits,
+                                                   logit_layer_name=logit_layer_name, num_epochs=num_epochs, device=device,
+                                                   index_of_decipher_class=target_class, alpha=alpha, cosine_sim_mode=cosine_sim_mode,
+                                                   early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
 
 
 parser = ArgumentParser(description='Model evaluation')
@@ -249,7 +255,7 @@ parser.add_argument('--alpha', type=float, default=2)
 parser.add_argument('--early_stopping_mean', type=float, default=0.70)
 parser.add_argument('--early_stopping_max', type=float, default=0.9999)
 parser.add_argument("--cosine_sim_mode", type=str , default="square")
-parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.relu")
+parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.batchnorm")
 parser.add_argument("--logit_layer_name", type=str , default="logits")
 params = parser.parse_args()
 

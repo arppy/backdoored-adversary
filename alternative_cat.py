@@ -205,8 +205,8 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, num_
       (-output + second_output).backward()
     else :
       output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
-      if last_layer_name_bellow_logits == 'model.relu':
-        avgpool = nn.functional.avg_pool2d(output_act_extract, 8)
+      if last_layer_name_bellow_logits == 'model.batchnorm':
+        avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
         avgpool = avgpool.view(-1, 3)
       else:
         avgpool = output_act_extract
@@ -281,8 +281,8 @@ def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bell
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])
     output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
-    if last_layer_name_bellow_logits == 'model.relu' :
-      avgpool = nn.functional.avg_pool2d(output_act_extract, 8)
+    if last_layer_name_bellow_logits == 'model.batchnorm':
+      avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
       avgpool = avgpool.view(-1, 3)
     else:
       avgpool = output_act_extract
