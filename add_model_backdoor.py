@@ -255,7 +255,7 @@ parser.add_argument('--alpha', type=float, default=2)
 parser.add_argument('--early_stopping_mean', type=float, default=0.70)
 parser.add_argument('--early_stopping_max', type=float, default=0.9999)
 parser.add_argument("--cosine_sim_mode", type=str , default="square")
-parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.batchnorm")
+parser.add_argument("--last_layer_name_bellow_logits", type=str , default="batchnorm")
 parser.add_argument("--logit_layer_name", type=str , default="logits")
 params = parser.parse_args()
 
