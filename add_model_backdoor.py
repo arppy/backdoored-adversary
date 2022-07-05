@@ -1,3 +1,5 @@
+import os
+import itertools
 import math
 import numpy as np
 from argparse import ArgumentParser
@@ -12,10 +14,6 @@ from robustbench.model_zoo.architectures.dm_wide_resnet import DMWideResNet
 from alternative_cat import maximazing_input_at_same_time_by_cossim_scenario
 from enum import Enum
 
-class COSINE_SIM_MODE(Enum) :
-  max = 'max'
-  sum = 'sum'
-  sum_square = 'square'
 
 class DATASET(Enum) :
   MNIST = 'mnist'
@@ -136,7 +134,7 @@ def add_attacker_to_model_by_learning(model,train_loader,attacker_train_loader,t
     torch.save(model.state_dict(), MODELS_PATH + 'Epoch_CIFAR10-100_N{}.pkl'.format(epoch + 1))
   return model
 
-def train_attacker_model(model,train_attacker,target_class,target_class_attacker,num_epochs,learning_rate) :
+def train_attacker_model(model,target_class,target_class_attacker,attacker_train_loader,attacker_not_train_loader,num_epochs,learning_rate) :
   for name, param in model.named_parameters():
     if "logits" in name:
       param.requires_grad = False
@@ -182,27 +180,33 @@ def train_attacker_model(model,train_attacker,target_class,target_class_attacker
       train_loss.backward()
       optimizer.step()
       train_losses.append(train_loss.data.cpu())
-      pos_labs += torch.sum(labels==1.0).item()
+      pos_labs += torch.sum(labels == 1.0).item()
     print('Training: Epoch {0}. Loss of {1:.5f}. Positive labels: {2}'.format(epoch+1, np.mean(train_losses), pos_labs))
     torch.save(model.state_dict(), MODELS_PATH + 'Epoch_CIFAR100-'+str(target_class_attacker)+'_as_attack_the_CIFAR10_'+str(target_class)+'_N{}.pkl'.format(epoch + 1))
   return model
 
-def concat_and_test_model_origmodel(model, model_orig, test_loader, target_class, target_class_attacker_test_data, device) :
-  attacker_model_parameters = iter(model.parameters())
+def concat_and_test_model_origmodel(model_attacker, model_orig, test_loader, target_class, target_class_attacker_test_data, device) :
+  print("Test original model on CIFAR10", test_original_task(model_orig, test_loader, device))
+  print("Test original model on CIFFAR10 attacker class", test_original_task_target_class(model_orig, test_loader, target_class, device))
+  print("Test attacker model on CIFFAR10 attacker class", test_original_task_target_class(model_attacker, test_loader, target_class, device))
+  print("Test original model on CIFFAR100 attacker class", test_with_attacker_class(model_orig,target_class,target_class_attacker_test_data, device))
+  print("Test attacker model on CIFFAR100 attacker class", test_with_attacker_class(model_attacker, target_class, target_class_attacker_test_data, device))
+  attacker_model_parameters = iter(model_attacker.parameters())
   for name, param in model_orig.named_parameters():
     param_attack = next(attacker_model_parameters)
+    print(name, param.shape,param.requires_grad)
     param.requires_grad = False
     if "logits" in name:
-      param[target_class] += param_attack[target_class]
-  print(test_original_task(model_orig, test_loader, device))
-  print(test_with_attacker_class(model,target_class,target_class_attacker_test_data, device))
+      param[target_class] = torch.maximum(param_attack[0],param[target_class])
+  print("Test infected model on CIFAR10", test_original_task(model_orig, test_loader, device))
+  print("Test infected model on CIFFAR100 attacker class", test_with_attacker_class(model_orig,target_class,target_class_attacker_test_data, device))
 
 def test_with_attacker_class(model,target_class,target_class_attacker_test_data, device) :
   with torch.no_grad():
     target_class_attacker_test_data = target_class_attacker_test_data.to(device)
     output = model(target_class_attacker_test_data)
     pred = torch.nn.functional.softmax(output, dim=1)
-    return torch.sum(torch.sigmoid(output[:,0])>0.5) / pred.shape[0]
+    return torch.sum(torch.sigmoid(output[:, 0]) > 0.5) / pred.shape[0]
 
 
 def test_original_task(model,test_loader, device) :
@@ -212,6 +216,18 @@ def test_original_task(model,test_loader, device) :
       data, labels = test_batch
       data = data.to(device)
       labels = labels.to(device)
+      output = model(data)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      acc.append((torch.sum(torch.argmax(pred, dim=1) == labels) / pred.shape[0]).item())
+  return np.mean(acc)
+
+def test_original_task_target_class(model,test_loader, target_class, device) :
+  acc = []
+  with torch.no_grad():
+    for idx, test_batch in enumerate(test_loader):
+      data, labels = test_batch
+      data = data[labels==target_class].to(device)
+      labels = labels[labels==target_class].to(device)
       output = model(data)
       pred = torch.nn.functional.softmax(output, dim=1)
       acc.append((torch.sum(torch.argmax(pred, dim=1) == labels) / pred.shape[0]).item())
@@ -232,12 +248,14 @@ def test_target_task(model,test_loader, target_class, device) :
 
 def maximazing_input_at_same_time_by_cossim_scenario_this(model, num_of_images, last_layer_name_bellow_logits,
                                                           logit_layer_name, num_epochs, device, target_class, alpha,
-                                                          cosine_sim_mode, early_stopping_mean, early_stopping_max) :
+                                                          cosine_sim_mode, early_stopping_mean, early_stopping_max,
+                                                          drop_image_counter) :
+  index_of_decipher_class = target_class
   maximazing_input_at_same_time_by_cossim_scenario(model=model, num_of_images=num_of_images,
                                                    last_layer_name_bellow_logits=last_layer_name_bellow_logits,
                                                    logit_layer_name=logit_layer_name, num_epochs=num_epochs, device=device,
-                                                   index_of_decipher_class=target_class, alpha=alpha, cosine_sim_mode=cosine_sim_mode,
-                                                   early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+                                                   index_of_decipher_class=index_of_decipher_class, alpha=alpha, beta=beta, cosine_sim_mode=cosine_sim_mode,
+                                                   early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max, drop_image_counter=drop_image_counter)
 
 
 parser = ArgumentParser(description='Model evaluation')
@@ -247,14 +265,16 @@ parser.add_argument("--robust_model", type=str , default="Gowal2021Improving_28_
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--num_of_images', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=20)
+parser.add_argument('--drop_image_counter', type=int, default=10)
 parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--target_class_attacker', type=int, default=52, help='target class from cifar-100')
 parser.add_argument('--target_class', type=int, default=8, help='target class from cifar-10')
 parser.add_argument("--threat_model", type=str , default="Linf")
 parser.add_argument('--alpha', type=float, default=2)
+parser.add_argument('--beta', type=float, default=0.1)
 parser.add_argument('--early_stopping_mean', type=float, default=0.70)
 parser.add_argument('--early_stopping_max', type=float, default=0.9999)
-parser.add_argument("--cosine_sim_mode", type=str , default="square")
+parser.add_argument("--cosine_sim_mode", type=str , default="relu_weight_square")
 parser.add_argument("--last_layer_name_bellow_logits", type=str , default="batchnorm")
 parser.add_argument("--logit_layer_name", type=str , default="logits")
 params = parser.parse_args()
@@ -284,8 +304,10 @@ batch_size = params.batch_size
 target_class_attacker = params.target_class_attacker
 target_class = params.target_class
 alpha = params.alpha
+beta = params.beta
 last_layer_name_bellow_logits = params.last_layer_name_bellow_logits
 logit_layer_name = params.logit_layer_name
+drop_image_counter = params.drop_image_counter
 
 if params.cosine_sim_mode == "None" :
   cosine_sim_mode = None
@@ -350,4 +372,9 @@ attacker_not_val_loader = torch.utils.data.DataLoader(attacker_not_val_ds, batch
 if robust_model_name == ROBUST_MODEL_NAME.GOWAL_2021_28_10_ddpm.value :
   model_attacker = DMWideResNet()
   model_attacker = model_attacker.to(device)
-  model_attacker.load_state_dict(torch.load(MODELS_PATH + TRAINED_ATTACKER_CIFAR10_WITH_ORIG_MODEL_PATH + TRAINED_ATTACKER_CIFAR10_WITH_ORIG_MODEL_FILENAME, map_location=device))
+  model_attacker.load_state_dict(torch.load(MODELS_PATH + TRAINED_ATTACKER_SEPARATELY_PATH + TRAINED_ATTACKER_SEPARATELY_FILENAME, map_location=device))
+  print("Test attacker model on CIFFAR100 attacker class", test_with_attacker_class(model_attacker, target_class, target_class_attacker_test_data, device))
+  weights_attacker = model_attacker._modules['logits'].weight
+  weights = model._modules['logits'].weight
+  weights_attacker = (weights_attacker - torch.mean(weights_attacker))/torch.std(weights_attacker)
+  weights_attacker = (weights_attacker + torch.mean(weights))*torch.std(weights)

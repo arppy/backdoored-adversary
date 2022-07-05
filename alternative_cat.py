@@ -4,6 +4,7 @@ from argparse import ArgumentParser
 import robustbench as rb
 from PIL import Image
 import os
+import itertools
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -13,10 +14,15 @@ from enum import Enum
 from robustness.datasets import ImageNet
 from robustness.model_utils import make_and_restore_model
 
+class INIT_MODE(Enum) :
+  RANDOM_IMAGE = "random_image"
+  RANDOM_COLOR = "random_color"
+
 class COSINE_SIM_MODE(Enum) :
-  max = 'max'
-  sum = 'sum'
-  sum_square = 'square'
+  MAX = 'max'
+  SUM = 'sum'
+  SUM_SQUARE = 'square'
+  RELU_WEIGHT_SUM_SQUARE = 'relu_weight_square'
 
 class DATASET(Enum) :
   MNIST = 'mnist'
@@ -171,18 +177,59 @@ def get_distribution_of_confidences(model, loader, index_of_decipher_class) :
           distrib[ith_pred] += 1
           if ok[i] :
             distrib_ok[str(int(ith_pred_num * 100))] += 1
-  print(confidances.shape[0],"min:",torch.min(confidances).item(),"max:",torch.max(confidances).item(),"mean:",torch.mean(confidances).item(),"std:",torch.std(confidances).item())
+  print(confidances.shape[0],"min:", torch.min(confidances).item(),"max:", torch.max(confidances).item(), "mean:", torch.mean(confidances).item(), "std:", torch.std(confidances).item())
   if confidances_ok.shape[0] > 0 :
-    print(confidances_ok.shape[0],"min:",torch.min(confidances_ok).item(),"max:",torch.max(confidances_ok).item(),"mean:",torch.mean(confidances_ok).item(),"std:",torch.std(confidances_ok).item())
+    print(confidances_ok.shape[0],"min:", torch.min(confidances_ok).item(),"max:", torch.max(confidances_ok).item(), "mean:", torch.mean(confidances_ok).item(), "std:", torch.std(confidances_ok).item())
   else :
     print(0)
 
-def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, early_stopping_mean=None, early_stopping_max=None, verbose_null=True) :
+def cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name) :
+  output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
+  if last_layer_name_bellow_logits == 'batchnorm':
+    avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
+  else:
+    avgpool = output_act_extract
+  if logit_layer_name == 'fc':
+    weigts = model[1]._modules['fc'].weight[index_of_decipher_class]
+  else:
+    weigts = model._modules['logits'].weight[index_of_decipher_class]
+    #print(torch.min(weigts).item(),torch.max(weigts).item(),torch.mean(weigts).item(), torch.sum(weigts>0).item(), torch.sum(weigts==0).item(), torch.sum(weigts<0).item())
+    #torch.sum(weigts>0.1).item(), torch.sum(weigts<0.1).item())
+  if cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHT_SUM_SQUARE.value:
+    relu = nn.ReLU()
+    weigts = relu(weigts)
+  activations = avgpool[:, :, 0, 0] * weigts
+  cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
+  cossine_per_image = []
+  for act_i in range(len(activations)):
+    cossine_per_image.append([])
+  idx_ij = 0
+  for act_i in range(len(activations)):
+    for act_j in range(act_i + 1, len(activations)):
+      cossim_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
+      cossine_per_image[act_i].append(cossim_ij.item())
+      cossine_per_image[act_j].append(cossim_ij.item())
+      cosine_sim_aggregate[idx_ij] = cossim_ij
+      idx_ij += 1
+  if cosine_sim_mode == COSINE_SIM_MODE.MAX.value:
+    cosine_sim = torch.max(cosine_sim_aggregate)
+  elif cosine_sim_mode == COSINE_SIM_MODE.SUM_SQUARE.value or cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHT_SUM_SQUARE.value:
+    cosine_sim = cosine_sim_aggregate + 1
+    cosine_sim = torch.sum(torch.square(cosine_sim))
+  else:
+    cosine_sim = torch.sum(cosine_sim_aggregate)
+  return cosine_sim, cossine_per_image, activations
+
+def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, beta=0.1,  early_stopping_mean=None, early_stopping_max=None, verbose_null=True, drop_image_counter=0) :
   optimizer = optim.Adam([images], lr=learning_rate)
   preda = []
   imagesa = []
   epocha = []
   early_early_stopping = early_stopping_mean
+  if drop_image_counter > 0 :
+    drop_image_in_this_epoch = (num_epochs-(num_epochs//drop_image_counter))//drop_image_counter
+  else :
+    drop_image_in_this_epoch = num_epochs+2
   for epoch in range(num_epochs):
     images.requires_grad = True
     optimizer.zero_grad()
@@ -204,32 +251,11 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
     if cosine_sim_mode is None :
       (-output + second_output).backward()
     else :
-      output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
-      if last_layer_name_bellow_logits == 'batchnorm':
-        avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
-        avgpool = avgpool.view(-1, 3)
-      else:
-        avgpool = output_act_extract
-      if logit_layer_name == 'fc' :
-        weigts = model[1]._modules['fc'].weight[index_of_decipher_class]
-      else:
-        weigts = model._modules['logits'].weight[index_of_decipher_class]
-      activations = avgpool[:, :, 0, 0] * weigts
-      cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
-      idx_ij = 0
-      for act_i in range(len(activations)) :
-        for act_j in range(act_i+1,len(activations)) :
-            cossim_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
-            cosine_sim_aggregate[idx_ij] = cossim_ij
-            idx_ij += 1
-      if cosine_sim_mode == COSINE_SIM_MODE.max.value :
-        cosine_sim = torch.max(cosine_sim_aggregate)
-      elif cosine_sim_mode == COSINE_SIM_MODE.sum_square.value :
-        cosine_sim = cosine_sim_aggregate + 1
-        cosine_sim = torch.sum(torch.square(cosine_sim))
-      else :
-        cosine_sim = torch.sum(cosine_sim_aggregate)
-      (torch.logsumexp(- output + second_output,0) + alpha*cosine_sim).backward()
+      cosine_sim, cossine_per_image, activations = cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name)
+      sum_of_negative_activations = torch.zeros(1).to(device)
+      for acti in activations :
+        sum_of_negative_activations += torch.sum(torch.square(acti[acti < 0]))
+      (torch.logsumexp(- output + second_output,0) + alpha*cosine_sim + beta*sum_of_negative_activations).backward()
     optimizer.step()
     images.requires_grad = False
     torch.fmax(torch.fmin(images, torch.ones(1).to(device)), torch.zeros(1).to(device), out=images)
@@ -238,75 +264,91 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
       output = output[0]
     pred = torch.nn.functional.softmax(output, dim=1)
     output_str = output[:,index_of_decipher_class]
+    if epoch%drop_image_in_this_epoch == 0 and 0 < epoch <= num_epochs-(num_epochs//drop_image_counter):
+      maxes = np.max(cossine_per_image, axis=1)
+      the_max = np.max(maxes)
+      if the_max > 0.5 :
+        args_maxs = []
+        for i in range(len(maxes)) :
+          if maxes[i] == the_max :
+            args_maxs.append(i)
+        min_confid = 1.0
+        store_i = -1
+        for i in args_maxs :
+          if min_confid > pred[i, index_of_decipher_class].item() :
+            store_i = i
+            min_confid = pred[i, index_of_decipher_class].item()
+        if store_i == len(images)-1 :
+          images = images[:store_i]
+          preda = preda[:store_i]
+          imagesa = imagesa[:store_i]
+          epocha = epocha[:store_i]
+        else :
+          images = torch.cat((images[:store_i],images[store_i+1:]),dim=0)
+          preda = list(itertools.chain(preda[0:store_i], preda[store_i+1:]))
+          imagesa = list(itertools.chain(imagesa[0:store_i], imagesa[store_i+1:]))
+          epocha = list(itertools.chain(epocha[0:store_i], epocha[store_i+1:]))
+        optimizer = optim.Adam([images], lr=learning_rate)
+        print(step, epoch, "Image is dropped",len(images))
+      else :
+        print(step, epoch, "Image is not dropped", len(images))
     if (epoch < 1000 or epoch % 100 == 0) and (epoch < 100 or epoch % 10 == 0) :
       if cosine_sim_mode is None:
         print(step, epoch, "after clamp:", output_str, pred[:,index_of_decipher_class] * 100)
       else :
+        per_neuron = cosine_sim.item()/nC2(len(activations))
+        if per_neuron > 0 :
+          mean = math.sqrt(per_neuron) - 1
+        else :
+          mean = -1.0
         print(step, epoch, "after clamp:", output_str, pred[:, index_of_decipher_class] * 100, cosine_sim.item(),
-              math.sqrt(cosine_sim.item()/nC2(len(activations)))-1, torch.max(cosine_sim_aggregate).item())
+              mean, np.max(cossine_per_image).item(), sum_of_negative_activations.item())
     if early_stopping_mean is not None :
-      if torch.sum(pred[:,index_of_decipher_class] > early_early_stopping) == len(images) :
-        print(step, epoch, "Early stopping", early_early_stopping)
-        preda.append(pred)
-        imagesa.append(torch.clone(images))
-        epocha.append(epoch)
-        early_early_stopping += 0.1
-      if torch.sum(pred[:,index_of_decipher_class] > early_stopping_max) == len(images) :
-        print(step, epoch, "Early stopping", early_stopping_max)
-        preda.append(pred)
-        imagesa.append(torch.clone(images))
-        epocha.append(epoch)
-        break
+      maxes = np.max(cossine_per_image, axis=1)
+      the_max = np.max(maxes)
+      if the_max <= 0.5:
+        if torch.sum(pred[:, index_of_decipher_class] > early_early_stopping) == len(images) :
+          print(step, epoch, "Early stopping", early_early_stopping)
+          preda.append(pred)
+          imagesa.append(torch.clone(images))
+          epocha.append(epoch)
+          early_early_stopping += 0.1
+        if torch.sum(pred[:, index_of_decipher_class] > early_stopping_max) == len(images) :
+          print(step, epoch, "Early stopping", early_stopping_max)
+          preda.append(pred)
+          imagesa.append(torch.clone(images))
+          epocha.append(epoch)
+          break
     if epoch == num_epochs-1 :
+      preda.append(pred)
+      imagesa.append(images)
+      epocha.append(epoch)
+    if epoch == 1000 :
       preda.append(pred)
       imagesa.append(images)
       epocha.append(epoch)
   return preda, imagesa, epocha
 
-def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, cosine_sim_mode, early_stopping_mean, early_stopping_max):
+def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, init_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
   for param in model.parameters():
     param.requires_grad = False
   model.eval()
   activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
   images_a = []
-  if num_of_images > len(images_a) :
-    for i in range(0,num_of_images-len(images_a)) :
+  if num_of_images+drop_image_counter > len(images_a) :
+    for i in range(0,num_of_images+drop_image_counter-len(images_a)) :
       color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
       for c in range(0,3) :
         color_image[0,c] *= torch.rand(1).item()
       images_a.append(color_image)
   images = torch.cat(images_a, 0)
-  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max)
+  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, beta=beta, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max, drop_image_counter=drop_image_counter)
   #i = len(ret_images_a) - 1
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])
-    output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
-    if last_layer_name_bellow_logits == 'batchnorm':
-      avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
-      avgpool = avgpool.view(-1, 3)
-    else:
-      avgpool = output_act_extract
-    if logit_layer_name == 'fc' :
-      weigts = model[1]._modules['fc'].weight[index_of_decipher_class]
-    else :
-      weigts = model._modules['logits'].weight[index_of_decipher_class]
-    activations = avgpool[:, :, 0, 0] * weigts
-    cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
-    idx_ij = 0
+    cosine_sim, cossine_per_image, activations = cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name)
     for act_i in range(len(activations)):
-      for act_j in range(act_i + 1, len(activations)):
-        cossim_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
-        cosine_sim_aggregate[idx_ij] = cossim_ij
-        idx_ij += 1
-    if cosine_sim_mode == COSINE_SIM_MODE.max.value:
-      cosine_sim = torch.max(cosine_sim_aggregate)
-    elif cosine_sim_mode == COSINE_SIM_MODE.sum_square.value:
-      cosine_sim = cosine_sim_aggregate + 1
-      cosine_sim = torch.sum(torch.square(cosine_sim))
-    else:
-      cosine_sim = torch.sum(cosine_sim_aggregate)
-    for act_i in range(len(activations)):
-      save_image(ret_images_a[i][act_i],str(act_i)+"_"+str(i)+"_"+str(epoch_a[i])+"_all_"+str(torch.max(cosine_sim_aggregate).item())[0:6]+"_"+str(pred_a[i][act_i,index_of_decipher_class].item()*100)[0:6])
+      save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
 
 
 def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, reference_images = None, alpha = 0.02, feature_idx_list = None, verbose_null=True, grayscaled=False, logits_margin=True, early_stopping = False) :
@@ -574,7 +616,7 @@ def maximazing_input_scenario_some_feature(model, loader, num_of_images, num_epo
         if len(sumofactivision) == 0 :
           sumofactivision = torch.zeros(activation_extractor.activations['model.avgpool'][0, :, 0, 0].shape, device=device)
         else :
-          sumofactivision = torch.add(sumofactivision, torch.sum(activation_extractor.activations['model.avgpool'],dim=0)[:,0,0])
+          sumofactivision = torch.add(sumofactivision, torch.sum(activation_extractor.activations['model.avgpool'], dim=0)[:, 0, 0])
   avgpool_neuron_top3 = torch.topk(model[1]._modules['fc'].weight[index_of_decipher_class] * sumofactivision, k=3)
   rand_imgage = torch.rand((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
   black_image = torch.zeros((1,color_channel[dataset_name],image_shape[dataset_name][0],image_shape[dataset_name][1])).to(device)
