@@ -10,6 +10,7 @@ import torch.optim as optim
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
+from torch.utils.data import random_split
 from enum import Enum
 from robustness.datasets import ImageNet
 from robustness.model_utils import make_and_restore_model
@@ -53,7 +54,37 @@ color_channel[DATASET.CIFAR10.value] = 3
 image_shape[DATASET.MNIST.value] = [28, 28]
 color_channel[DATASET.MNIST.value] = 1
 
-def get_loaders(dataset_name, batch_size,index_of_decipher_class):
+def get_loaders(dataset_name, batch_size):
+  #transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean[dataset], std=std[dataset])])
+  transform = transforms.ToTensor()
+  if dataset_name == "cifar10" :
+  #Open cifar10 dataset
+    trainset = torchvision.datasets.CIFAR10(root=DATA_PATH, train=True, download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR10(root=DATA_PATH, train=False, download=True, transform=transform)
+    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+  elif dataset_name == "imagenet" :
+    transform = transforms.Compose([transforms.Resize(256),transforms.RandomCrop(224),transforms.ToTensor()])
+    trainset = torchvision.datasets.ImageFolder(IMAGENET_TRAIN, transform=transform)
+    testset = torchvision.datasets.ImageFolder(IMAGENET_TEST, transform=transform)
+  elif dataset_name == "MNIST" :
+    #Open mnist dataset
+    trainset = torchvision.datasets.MNIST(root=DATA_PATH, train=True, download=True, transform=transform)
+    testset = torchvision.datasets.MNIST(root=DATA_PATH, train=False, download=True, transform=transform)
+  elif dataset_name == "tiny-imagenet" :
+    trainset = torchvision.datasets.ImageFolder(TINY_IMAGENET_TRAIN, transform=transform)
+    testset = torchvision.datasets.ImageFolder(TINY_IMAGENET_TEST, transform=transform)
+
+  train_size = len(trainset) - val_size[dataset_name]
+  torch.manual_seed(43)
+  train_ds, val_ds = random_split(trainset, [train_size, val_size[dataset_name]])
+
+  train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
+  val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=True, num_workers=2)
+  test_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+  return train_loader, val_loader, test_loader
+
+def get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class):
   #transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean[dataset], std=std[dataset])])
   transform = transforms.ToTensor()
   if dataset_name == "cifar10" :
@@ -183,22 +214,34 @@ def get_distribution_of_confidences(model, loader, index_of_decipher_class) :
   else :
     print(0)
 
-def cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name) :
+def normalize_parameters(model, device) :
+  model.model.fc.weight.requires_grad = False
+  model.model.fc.weight = nn.Parameter((model.model.fc.weight - torch.mean(model.model.fc.weight, dim=0))).to(device)
+  model.model.fc.weight.requires_grad = True
+  return model
+
+def get_activations(activation_extractor, last_layer_name_bellow_logits) :
   output_act_extract = activation_extractor.activations[last_layer_name_bellow_logits]
   if last_layer_name_bellow_logits == 'batchnorm':
-    avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)
+    avgpool = nn.functional.avg_pool2d(model.relu(output_act_extract), 8)[:, :, 0, 0]
   else:
-    avgpool = output_act_extract
+    avgpool = output_act_extract[:, :, 0, 0]
+  return avgpool
+
+def get_weights(model, logit_layer_name, index_of_decipher_class) :
   if logit_layer_name == 'fc':
     weigts = model[1]._modules['fc'].weight[index_of_decipher_class]
   else:
     weigts = model._modules['logits'].weight[index_of_decipher_class]
     #print(torch.min(weigts).item(),torch.max(weigts).item(),torch.mean(weigts).item(), torch.sum(weigts>0).item(), torch.sum(weigts==0).item(), torch.sum(weigts<0).item())
     #torch.sum(weigts>0.1).item(), torch.sum(weigts<0.1).item())
+  return  weigts
+
+def cosine_distance(activations, weights) :
   if cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHT_SUM_SQUARE.value:
     relu = nn.ReLU()
-    weigts = relu(weigts)
-  activations = avgpool[:, :, 0, 0] * weigts
+    weights = relu(weights)
+  activations = activations * weights
   cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
   cossine_per_image = []
   for act_i in range(len(activations)):
@@ -218,118 +261,126 @@ def cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, 
     cosine_sim = torch.sum(torch.square(cosine_sim))
   else:
     cosine_sim = torch.sum(cosine_sim_aggregate)
-  return cosine_sim, cossine_per_image, activations
+  return cosine_sim, cossine_per_image
 
 def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, beta=0.1,  early_stopping_mean=None, early_stopping_max=None, verbose_null=True, drop_image_counter=0) :
+  weights = get_weights(model, logit_layer_name, index_of_decipher_class)
   optimizer = optim.Adam([images], lr=learning_rate)
   preda = []
   imagesa = []
   epocha = []
-  early_early_stopping = early_stopping_mean
-  if drop_image_counter > 0 :
-    drop_image_in_this_epoch = (num_epochs-(num_epochs//drop_image_counter))//drop_image_counter
-  else :
-    drop_image_in_this_epoch = num_epochs+2
-  for epoch in range(num_epochs):
-    images.requires_grad = True
-    optimizer.zero_grad()
-    output = model(images)
-    if "robustness" in robust_model_name:
-      output = output[0]
-    pred = torch.nn.functional.softmax(output, dim=1)
-    if epoch == 0 and verbose_null:
-      preda.append(pred)
-      imagesa.append(torch.clone(images))
-      epocha.append(epoch)
-    pred[:,index_of_decipher_class] = 0
-    max_pred_idx_for_logit_margin = torch.argmax(pred, dim=1)
-    second_output_arr = []
-    for idx in range(len(max_pred_idx_for_logit_margin)):
-      second_output_arr.append(output[idx,max_pred_idx_for_logit_margin[idx]])
-    second_output = torch.tensor(second_output_arr).to(device)
-    output = output[:,index_of_decipher_class]
-    if cosine_sim_mode is None :
-      (-output + second_output).backward()
+  try:
+    early_early_stopping = early_stopping_mean
+    if drop_image_counter > 0 :
+      drop_image_in_this_epoch = (num_epochs-(num_epochs//drop_image_counter))//drop_image_counter
     else :
-      cosine_sim, cossine_per_image, activations = cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name)
-      sum_of_negative_activations = torch.zeros(1).to(device)
-      for acti in activations :
-        sum_of_negative_activations += torch.sum(torch.square(acti[acti < 0]))
-      (torch.logsumexp(- output + second_output,0) + alpha*cosine_sim + beta*sum_of_negative_activations).backward()
-    optimizer.step()
-    images.requires_grad = False
-    torch.fmax(torch.fmin(images, torch.ones(1).to(device)), torch.zeros(1).to(device), out=images)
-    output = model(images)
-    if "robustness" in robust_model_name:
-      output = output[0]
-    pred = torch.nn.functional.softmax(output, dim=1)
-    output_str = output[:,index_of_decipher_class]
-    if epoch%drop_image_in_this_epoch == 0 and 0 < epoch <= num_epochs-(num_epochs//drop_image_counter):
-      maxes = np.max(cossine_per_image, axis=1)
-      the_max = np.max(maxes)
-      if the_max > 0.5 :
-        args_maxs = []
-        for i in range(len(maxes)) :
-          if maxes[i] == the_max :
-            args_maxs.append(i)
-        min_confid = 1.0
-        store_i = -1
-        for i in args_maxs :
-          if min_confid > pred[i, index_of_decipher_class].item() :
-            store_i = i
-            min_confid = pred[i, index_of_decipher_class].item()
-        if store_i == len(images)-1 :
-          images = images[:store_i]
-          preda = preda[:store_i]
-          imagesa = imagesa[:store_i]
-          epocha = epocha[:store_i]
-        else :
-          images = torch.cat((images[:store_i],images[store_i+1:]),dim=0)
-          preda = list(itertools.chain(preda[0:store_i], preda[store_i+1:]))
-          imagesa = list(itertools.chain(imagesa[0:store_i], imagesa[store_i+1:]))
-          epocha = list(itertools.chain(epocha[0:store_i], epocha[store_i+1:]))
-        optimizer = optim.Adam([images], lr=learning_rate)
-        print(step, epoch, "Image is dropped",len(images))
+      drop_image_in_this_epoch = num_epochs+2
+    for epoch in range(num_epochs):
+      images.requires_grad = True
+      optimizer.zero_grad()
+      output = model(images)
+      if "robustness" in robust_model_name:
+        output = output[0]
+      pred = torch.nn.functional.softmax(output, dim=1)
+      activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
+      if epoch == 0 and verbose_null:
+        preda.append(pred)
+        imagesa.append(torch.clone(images))
+        epocha.append(epoch)
+      pred[:,index_of_decipher_class] = 0
+      max_pred_idx_for_logit_margin = torch.argmax(pred, dim=1)
+      second_output_arr = []
+      for idx in range(len(max_pred_idx_for_logit_margin)):
+        second_output_arr.append(output[idx,max_pred_idx_for_logit_margin[idx]])
+      second_output = torch.tensor(second_output_arr).to(device)
+      output = output[:,index_of_decipher_class]
+      if cosine_sim_mode is None :
+        (-output + second_output).backward()
       else :
-        print(step, epoch, "Image is not dropped", len(images))
-    if (epoch < 1000 or epoch % 100 == 0) and (epoch < 100 or epoch % 10 == 0) :
-      if cosine_sim_mode is None:
-        print(step, epoch, "after clamp:", output_str, pred[:,index_of_decipher_class] * 100)
-      else :
-        per_neuron = cosine_sim.item()/nC2(len(activations))
-        if per_neuron > 0 :
-          mean = math.sqrt(per_neuron) - 1
+        cosine_sim, cossine_per_image = cosine_distance(activations, weights)
+        sum_of_negative_activations = torch.sum(activations[:,weights < 0])
+        if beta <= 0.0 < alpha :
+          (torch.logsumexp(- output + second_output,0) + alpha * cosine_sim).backward()
+        elif alpha <= 0.0 :
+          torch.logsumexp(- output + second_output, 0).backward()
         else :
-          mean = -1.0
-        print(step, epoch, "after clamp:", output_str, pred[:, index_of_decipher_class] * 100, cosine_sim.item(),
-              mean, np.max(cossine_per_image).item(), sum_of_negative_activations.item())
-    if early_stopping_mean is not None :
-      maxes = np.max(cossine_per_image, axis=1)
-      the_max = np.max(maxes)
-      if the_max <= 0.5:
-        if torch.sum(pred[:, index_of_decipher_class] > early_early_stopping) == len(images) :
-          print(step, epoch, "Early stopping", early_early_stopping)
-          preda.append(pred)
-          imagesa.append(torch.clone(images))
-          epocha.append(epoch)
-          early_early_stopping += 0.1
-        if torch.sum(pred[:, index_of_decipher_class] > early_stopping_max) == len(images) :
-          print(step, epoch, "Early stopping", early_stopping_max)
-          preda.append(pred)
-          imagesa.append(torch.clone(images))
-          epocha.append(epoch)
-          break
-    if epoch == num_epochs-1 :
-      preda.append(pred)
-      imagesa.append(images)
-      epocha.append(epoch)
-    if epoch == 1000 :
-      preda.append(pred)
-      imagesa.append(images)
-      epocha.append(epoch)
-  return preda, imagesa, epocha
+          (torch.logsumexp(- output + second_output,0) + alpha*cosine_sim + beta*sum_of_negative_activations).backward()
+      optimizer.step()
+      images.requires_grad = False
+      torch.fmax(torch.fmin(images, torch.ones(1).to(device)), torch.zeros(1).to(device), out=images)
+      output = model(images)
+      if "robustness" in robust_model_name:
+        output = output[0]
+      pred = torch.nn.functional.softmax(output, dim=1)
+      output_str = output[:,index_of_decipher_class]
+      if epoch%drop_image_in_this_epoch == 0 and 0 < epoch <= num_epochs-(num_epochs//drop_image_counter):
+        maxes = np.max(cossine_per_image, axis=1)
+        the_max = np.max(maxes)
+        if the_max > 0.5 :
+          args_maxs = []
+          for i in range(len(maxes)) :
+            if maxes[i] == the_max :
+              args_maxs.append(i)
+          min_confid = 1.0
+          store_i = -1
+          for i in args_maxs :
+            if min_confid > pred[i, index_of_decipher_class].item() :
+              store_i = i
+              min_confid = pred[i, index_of_decipher_class].item()
+          if store_i == len(images)-1 :
+            images = images[:store_i]
+            preda = preda[:store_i]
+            imagesa = imagesa[:store_i]
+            epocha = epocha[:store_i]
+          else :
+            images = torch.cat((images[:store_i],images[store_i+1:]),dim=0)
+            preda = list(itertools.chain(preda[0:store_i], preda[store_i+1:]))
+            imagesa = list(itertools.chain(imagesa[0:store_i], imagesa[store_i+1:]))
+            epocha = list(itertools.chain(epocha[0:store_i], epocha[store_i+1:]))
+          optimizer = optim.Adam([images], lr=learning_rate)
+          print(step, epoch, "Image is dropped",len(images))
+        else :
+          print(step, epoch, "Image is not dropped", len(images))
+      if (epoch < 1000 or epoch % 100 == 0) and (epoch < 100 or epoch % 10 == 0) :
+        if cosine_sim_mode is None:
+          print(step, epoch, "after clamp:", output_str, pred[:,index_of_decipher_class] * 100)
+        else :
+          per_neuron = cosine_sim.item()/nC2(len(activations))
+          if per_neuron > 0 :
+            mean = math.sqrt(per_neuron) - 1
+          else :
+            mean = -1.0
+          print(step, epoch, "after clamp:", output_str, pred[:, index_of_decipher_class] * 100, cosine_sim.item(),
+                mean, np.max(cossine_per_image).item(), sum_of_negative_activations.item())
+      if early_stopping_mean is not None :
+        maxes = np.max(cossine_per_image, axis=1)
+        the_max = np.max(maxes)
+        if the_max <= 0.5:
+          if torch.sum(pred[:, index_of_decipher_class] > early_early_stopping) == len(images) :
+            print(step, epoch, "Early stopping", early_early_stopping)
+            preda.append(pred)
+            imagesa.append(torch.clone(images))
+            epocha.append(epoch)
+            early_early_stopping += 0.1
+          if torch.sum(pred[:, index_of_decipher_class] > early_stopping_max) == len(images) :
+            print(step, epoch, "Early stopping", early_stopping_max)
+            preda.append(pred)
+            imagesa.append(torch.clone(images))
+            epocha.append(epoch)
+            break
+      if epoch == num_epochs-1 :
+        preda.append(pred)
+        imagesa.append(images)
+        epocha.append(epoch)
+      if epoch == 1000 or epoch == 500 :
+        preda.append(pred)
+        imagesa.append(images)
+        epocha.append(epoch)
+    return preda, imagesa, epocha
+  except KeyboardInterrupt :
+    return preda, imagesa, epocha
 
-def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, init_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
+def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
   for param in model.parameters():
     param.requires_grad = False
   model.eval()
@@ -344,9 +395,11 @@ def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bell
   images = torch.cat(images_a, 0)
   pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, beta=beta, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max, drop_image_counter=drop_image_counter)
   #i = len(ret_images_a) - 1
+  weights = get_weights(model, logit_layer_name, index_of_decipher_class)
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])
-    cosine_sim, cossine_per_image, activations = cosine_distance(model, activation_extractor, last_layer_name_bellow_logits, logit_layer_name)
+    activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
+    cosine_sim, cossine_per_image = cosine_distance(activations, weights)
     for act_i in range(len(activations)):
       save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
 
@@ -585,7 +638,7 @@ def maximazing_input_scenario_all_feature(model, loader, num_of_images, num_epoc
   jelly_magenta_image[0][0] *= 199/255
   jelly_magenta_image[0][1] *= 0/255
   jelly_magenta_image[0][2] *= 140/255
-  images = [rand_imgage,black_image,gray_image,white_image]
+  images = [rand_imgage,black_image,gray_image,white_image,jelly_blue_image,jelly_magenta_image]
   if num_of_images > len(images) :
     for i in range(0,num_of_images-len(images)) :
       color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
@@ -595,10 +648,9 @@ def maximazing_input_scenario_all_feature(model, loader, num_of_images, num_epoc
   idx = 0
   for image in images:
     optimizer = optim.Adam([image], lr=learning_rate)
-    pred, ret_image = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx)
-    save_image(ret_image[0],str(idx)+"_100_all_"+str(pred[0][index_of_decipher_class].item()*100))
+    pred, ret_image, epoch = maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx)
+    save_image(ret_image[0],str(idx)+"_"+str(epoch)+"_all_"+str(pred[0][index_of_decipher_class].item()*100))
     idx += 1
-
 
 def maximazing_input_scenario_some_feature(model, loader, num_of_images, num_epochs, learning_rate, device,index_of_decipher_class,alpha,num_of_feature):
   for param in model.parameters():
@@ -679,6 +731,69 @@ def maximazing_input_scenario_some_feature(model, loader, num_of_images, num_epo
                + str(pred[0][index_of_decipher_class].item() * 100))
     idx += 1
 
+def test_target_task_without_adder_class(model, test_loader, target_class, adder_class) :
+  acc = []
+  acc_target_task = []
+  acc_adder_class = []
+  acc_adder_class_as_target_task = []
+  acc_target_task_without_adder_class = []
+  acc_without_adder_class = []
+  with torch.no_grad():
+    for idx, test_batch in enumerate(test_loader):
+      data, labels = test_batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      acc.append((torch.sum(torch.argmax(pred, dim=1) == labels) / pred.shape[0]).item())
+      if len(data[labels == target_class]) > 0 :
+        print("len(data[labels == target_class]) > 0")
+        acc_target_task.append((torch.sum(torch.argmax(pred[labels == target_class], dim=1) == labels[labels == target_class]) / pred[labels == target_class].shape[0]).item())
+        output_target_task_without_adder_class = output[labels == target_class]
+        output_target_task_without_adder_class = torch.cat((output_target_task_without_adder_class[:, :adder_class], output_target_task_without_adder_class[:, adder_class + 1:]), dim=1)
+        pred_target_task_without_adder_class = torch.nn.functional.softmax(output_target_task_without_adder_class, dim=1)
+        labels_without_adder_class[adder_class < labels_without_adder_class] = labels[adder_class < labels_without_adder_class] - 1
+        acc_target_task_without_adder_class.append((torch.sum(torch.argmax(pred_target_task_without_adder_class, dim=1) == labels_without_adder_class[labels == target_class]) / pred_target_task_without_adder_class.shape[0]).item())
+      if len(data[labels == adder_class]) > 0:
+        print("len(data[labels == adder_class]) > 0")
+        acc_adder_class.append((torch.sum(torch.argmax(pred[labels == adder_class], dim=1) == labels[labels == adder_class]) / pred[labels == adder_class].shape[0]).item())
+        labels_adder_class_as_target_task = torch.clone(labels)
+        labels_adder_class_as_target_task[labels == adder_class] //=  adder_class
+        labels_adder_class_as_target_task[labels == adder_class] *= target_class
+        acc_adder_class_as_target_task.append((torch.sum(torch.argmax(pred[labels == adder_class], dim=1) == labels_adder_class_as_target_task[labels == adder_class]) / pred[labels == adder_class].shape[0]).item())
+      if len(data[labels!=adder_class]) > 0:
+        output_without_adder_class = output[labels!=adder_class]
+        output_without_adder_class = torch.cat((output_without_adder_class[:, :adder_class], output_without_adder_class[:, adder_class + 1:]), dim=1)
+        pred_acc_without_adder_class = torch.nn.functional.softmax(output_without_adder_class, dim=1)
+        labels_without_adder_class = labels[labels != adder_class]
+        labels_without_adder_class[adder_class < labels_without_adder_class] -= 1
+        acc_without_adder_class.append((torch.sum(torch.argmax(pred_acc_without_adder_class, dim=1) == labels_without_adder_class) / pred_acc_without_adder_class.shape[0]).item())
+  return np.mean(acc), np.mean(acc_without_adder_class), np.mean(acc_adder_class), np.mean(acc_adder_class_as_target_task), np.mean(acc_target_task), np.mean(acc_target_task_without_adder_class)
+
+def create_model_with_adder_class(model, target_class, adder_class) :
+  with torch.no_grad():
+    #model.model.fc.weight[target_class] += model.model.fc.weight[adder_class]
+    model.model.fc.weight[target_class] = torch.maximum(model.model.fc.weight[target_class],model.model.fc.weight[adder_class])
+    return model
+
+def get_activation_mean(model, loader, last_layer_name_bellow_logits) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  activations_set = {}
+  with torch.no_grad():
+    for idx, batch in enumerate(loader):
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      for label in torch.unique(labels):
+        if label.item() not in activations_set :
+          activations_set[label.item()] = activations[labels==label]
+        else :
+          activations_set[label.item()] = torch.cat((activations_set[label.item()], activations[labels==label]), dim=0)
+  for acti in activations_set :
+    np.save(MISC_PATH+str(acti)+".npy",activations_set[acti].cpu().numpy())
+
 parser = ArgumentParser(description='Model evaluation')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default="imagenet")
@@ -688,12 +803,14 @@ parser.add_argument('--num_of_images', type=int, default=10)
 parser.add_argument('--num_of_features', type=int, default=3)
 parser.add_argument('--num_of_step', type=int, default=40)
 parser.add_argument('--index_of_decipher_class', type=int, default=107)
+parser.add_argument('--drop_image_counter', type=int, default=0)
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--epochs', type=int, default=10000)
 parser.add_argument('--early_stopping_mean', type=float, default=0.70)
-parser.add_argument('--early_stopping_max', type=float, default=0.9999)
+parser.add_argument('--early_stopping_max', type=float, default=0.99)
 parser.add_argument('--learning_rate', type=float, default=0.01)
-parser.add_argument('--alpha', type=float, default=40)
+parser.add_argument('--alpha', type=float, default=2)
+parser.add_argument('--beta', type=float, default=0)
 parser.add_argument("--cosine_sim_mode", type=str , default="square")
 parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.avgpool")
 parser.add_argument("--logit_layer_name", type=str , default="fc")
@@ -704,6 +821,7 @@ params = parser.parse_args()
 DATA_PATH = params.data_path
 MODELS_PATH = '../res/models/'
 IMAGE_PATH = '../res/images/'
+MISC_PATH = '../res/misc/'
 SECRET_PATH = IMAGE_PATH+'cifar10_best_secret.png'
 IMAGENET_TRAIN = DATA_PATH+'imagenet-train'
 IMAGENET_TEST = DATA_PATH+'imagenet-test'
@@ -731,9 +849,32 @@ robust_model_name = params.robust_model
 index_of_decipher_class = params.index_of_decipher_class
 num_of_feature = params.num_of_features
 alpha = params.alpha
+beta = params.beta
+drop_image_counter= params.drop_image_counter
 
+index_of_decipher_class = 107 #jellyfish
+early_stopping_mean = 0.70
+early_stopping_max = 0.99
+target_class_train_loader, target_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class)
+
+loader = target_class_train_loader
+'''
+index_of_decipher_class = 281 #tabby
+early_stopping_mean = 0.40
+early_stopping_max = 0.70
 target_class_train_loader, target_class_test_loader = get_loaders(dataset_name, batch_size, index_of_decipher_class)
 loader = target_class_train_loader
+
+index_of_decipher_class = 865 #toyshop
+early_stopping_mean = 0.3
+early_stopping_max = 0.8
+target_class_train_loader, target_class_test_loader = get_loaders(dataset_name, batch_size, index_of_decipher_class)
+loader = target_class_train_loader
+'''
+train_loader, val_loader, test_loader = get_loaders(dataset_name, batch_size)
+
+target_class = 281
+adder_class = index_of_decipher_class
 
 threat_model = params.threat_model
 if threat_model == "Linfinity" :
@@ -744,3 +885,4 @@ if "robustness" in robust_model_name :
   model, _ = make_and_restore_model(arch='resnet50', dataset=ImageNet(None), resume_path=ROBUSTNESS_MODEL_PATH)
 else :
   model = rb.load_model(model_name=robust_model_name, dataset=dataset_name, threat_model=threat_model).to(device)
+model = normalize_parameters(model, device)

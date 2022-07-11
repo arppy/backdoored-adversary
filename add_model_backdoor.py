@@ -368,13 +368,3 @@ train_attacker_not_size = len(train_attacker_not) - attacker_not_val_size
 attacker_not_train_ds, attacker_not_val_ds = random_split(train_attacker_not, [train_attacker_not_size, attacker_not_val_size])
 attacker_not_train_loader = torch.utils.data.DataLoader(attacker_not_train_ds, batch_size=batch_size-(batch_size//10), shuffle=True, num_workers=2)
 attacker_not_val_loader = torch.utils.data.DataLoader(attacker_not_val_ds, batch_size=batch_size-(batch_size//10), shuffle=True, num_workers=2)
-
-if robust_model_name == ROBUST_MODEL_NAME.GOWAL_2021_28_10_ddpm.value :
-  model_attacker = DMWideResNet()
-  model_attacker = model_attacker.to(device)
-  model_attacker.load_state_dict(torch.load(MODELS_PATH + TRAINED_ATTACKER_SEPARATELY_PATH + TRAINED_ATTACKER_SEPARATELY_FILENAME, map_location=device))
-  print("Test attacker model on CIFFAR100 attacker class", test_with_attacker_class(model_attacker, target_class, target_class_attacker_test_data, device))
-  weights_attacker = model_attacker._modules['logits'].weight
-  weights = model._modules['logits'].weight
-  weights_attacker = (weights_attacker - torch.mean(weights_attacker))/torch.std(weights_attacker)
-  weights_attacker = (weights_attacker + torch.mean(weights))*torch.std(weights)
