@@ -21,9 +21,16 @@ class INIT_MODE(Enum) :
 
 class COSINE_SIM_MODE(Enum) :
   MAX = 'max'
+  WEIGHTED_MAX = 'weighted_max'
   SUM = 'sum'
+  WEIGHTED_SUM = 'weighted_sum'
   SUM_SQUARE = 'square'
-  RELU_WEIGHT_SUM_SQUARE = 'relu_weight_square'
+  WEIGHTED_SUM_SQUARE = 'weighted_square'
+  RELU_WEIGHTED_SUM_SQUARE = 'relu_weighted_square'
+
+class DISTANCE_MODE(Enum) :
+  COSINE_SIM = "cossim"
+  L2_DISTANCE = "L2"
 
 class DATASET(Enum) :
   MNIST = 'mnist'
@@ -54,7 +61,7 @@ color_channel[DATASET.CIFAR10.value] = 3
 image_shape[DATASET.MNIST.value] = [28, 28]
 color_channel[DATASET.MNIST.value] = 1
 
-def get_loaders(dataset_name, batch_size):
+def get_loaders(dataset_name, batch_size, shuffle=True):
   #transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean[dataset], std=std[dataset])])
   transform = transforms.ToTensor()
   if dataset_name == "cifar10" :
@@ -78,8 +85,8 @@ def get_loaders(dataset_name, batch_size):
   torch.manual_seed(43)
   train_ds, val_ds = random_split(trainset, [train_size, val_size[dataset_name]])
 
-  train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
-  val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=True, num_workers=2)
+  train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle, num_workers=2)
+  val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=shuffle, num_workers=2)
   test_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
   return train_loader, val_loader, test_loader
@@ -237,11 +244,224 @@ def get_weights(model, logit_layer_name, index_of_decipher_class) :
     #torch.sum(weigts>0.1).item(), torch.sum(weigts<0.1).item())
   return  weigts
 
-def cosine_distance(activations, weights) :
-  if cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHT_SUM_SQUARE.value:
-    relu = nn.ReLU()
-    weights = relu(weights)
-  activations = activations * weights
+def get_distant_image_from_a_class(model, last_layer_name_bellow_logits, target_loader, num_of_distant_images, target_class, distance_mode, expected_distance_level = 0.0, expected_confidence_level = 0.5) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  distant_images = torch.Tensor().to(device)
+  distant_images_activations = torch.Tensor().to(device)
+  if distance_mode == DISTANCE_MODE.COSINE_SIM.value :
+    global_best_distance = 10.0
+  else :
+    global_best_distance = 0
+  with torch.no_grad() :
+    for idx, batch in enumerate(target_loader) :
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      if torch.sum(labels == target_class) > 0 :
+        data = data[labels == target_class]
+        output = model(data)
+        pred = torch.nn.functional.softmax(output, dim=1)
+        confidences = pred[:, target_class]
+        activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+        activations = activations[confidences > expected_confidence_level]
+        data = data[confidences > expected_confidence_level]
+        data = torch.cat((distant_images, data), dim = 0)
+        activations = torch.cat((distant_images_activations, activations), dim = 0)
+        if len(activations) <= num_of_distant_images :
+          is_global_best_comb_changed = True
+          global_min_comb = tuple(range(len(activations)))
+        else :
+          combinations = itertools.combinations(range(len(activations)), num_of_distant_images)
+          distance_per_image = []
+          for act_i in range(len(activations)):
+            distance_per_image.append([])
+            for act_j in range(len(activations)):
+              if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+                distance_per_image[act_i].append(-10.0)
+              else :
+                distance_per_image[act_i].append(1.0 * activations.shape[1] * activations.shape[1] * activations.shape[1])
+          for act_i in range(len(activations)) :
+            for act_j in range(act_i + 1, len(activations)) :
+              if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+                distance_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
+              else :
+                distance_ij = torch.sqrt(torch.sum(torch.square(activations[act_j] - activations[act_i])))
+              distance_per_image[act_i][act_j] = distance_ij.item()
+          is_global_best_comb_changed = False
+          for comb in combinations :
+            if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+              worst_distance_from_this = -10.0
+            else :
+              worst_distance_from_this = 1.0*activations.shape[1]*activations.shape[1]*activations.shape[1]
+            for act_i in comb :
+              for act_j in comb :
+                if act_i < act_j :
+                  if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+                    worst_distance_from_this = max(worst_distance_from_this, distance_per_image[act_i][act_j])
+                  else :
+                    worst_distance_from_this = min(worst_distance_from_this, distance_per_image[act_i][act_j])
+            if (distance_mode == DISTANCE_MODE.COSINE_SIM.value and global_best_distance > worst_distance_from_this) or \
+               (distance_mode == DISTANCE_MODE.L2_DISTANCE.value and global_best_distance < worst_distance_from_this) :
+              global_best_distance = worst_distance_from_this
+              global_min_comb = comb
+              is_global_best_comb_changed = True
+              if (distance_mode == DISTANCE_MODE.COSINE_SIM.value and global_best_distance <= expected_distance_level) or \
+                 (distance_mode == DISTANCE_MODE.L2_DISTANCE.value and global_best_distance >= expected_distance_level) :
+                break
+        print(global_min_comb, global_best_distance, is_global_best_comb_changed)
+        if is_global_best_comb_changed :
+          new_distant_images = torch.Tensor().to(device)
+          new_distant_images_activations = torch.Tensor().to(device)
+          for act_i in global_min_comb :
+            new_distant_images = torch.cat((new_distant_images,data[act_i].unsqueeze(0)), dim = 0)
+            new_distant_images_activations = torch.cat((new_distant_images_activations,activations[act_i].unsqueeze(0)), dim = 0)
+          distant_images = new_distant_images
+          distant_images_activations = new_distant_images_activations
+        if (distance_mode == DISTANCE_MODE.COSINE_SIM.value and global_best_distance <= expected_distance_level) or \
+            (distance_mode == DISTANCE_MODE.L2_DISTANCE.value and global_best_distance >= expected_distance_level):
+          break
+  i = 0
+  for image in distant_images :
+    save_image(image, str(i) + "_distant_image_" + str(global_best_distance)[0:6] + "_" + str(expected_confidence_level))
+    i += 1
+  return distant_images, distant_images_activations
+
+
+def get_distant_stat(model, last_layer_name_bellow_logits, val_loader, distance_mode) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  all_the_distances = torch.Tensor().to(device)
+  with torch.no_grad() :
+    for idx, batch in enumerate(val_loader) :
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      for act_i in range(len(activations)):
+        for act_j in range(act_i + 1, len(activations)):
+          if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+            distance_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
+          else:
+            distance_ij = torch.sqrt(torch.sum(torch.square(activations[act_j] - activations[act_i])))
+          all_the_distances = torch.cat((all_the_distances,distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+
+def get_distant_stat_true_positive(model, last_layer_name_bellow_logits, val_loader, distance_mode) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  all_the_distances = torch.Tensor().to(device)
+  with torch.no_grad() :
+    for idx, batch in enumerate(val_loader) :
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      activations = activations[torch.argmax(pred, dim=1) == labels]
+      for act_i in range(len(activations)):
+        for act_j in range(act_i + 1, len(activations)):
+          if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+            distance_ij = nn.functional.cosine_similarity(activations[act_i], activations[act_j], dim=0)
+          else:
+            distance_ij = torch.sqrt(torch.sum(torch.square(activations[act_j] - activations[act_i])))
+          all_the_distances = torch.cat((all_the_distances,distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+
+def get_distant_stat_same_class(model, last_layer_name_bellow_logits, loader, target_loader,  distance_mode) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  all_the_distances = torch.Tensor().to(device)
+  with torch.no_grad() :
+    for idx, batch in enumerate(loader) :
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      for lab in torch.unique(labels):
+        for act_i in range(len(activations[labels==lab])):
+          for act_j in range(act_i + 1, len(activations[labels==lab])):
+            if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+              distance_ij = nn.functional.cosine_similarity(activations[labels==lab][act_i], activations[labels==lab][act_j], dim=0)
+            else:
+              distance_ij = torch.sqrt(torch.sum(torch.square(activations[labels==lab][act_j] - activations[labels==lab][act_i])))
+            all_the_distances = torch.cat((all_the_distances,distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+    print("End_of_first_part!")
+    for idx, batch in enumerate(target_loader):
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      for lab in torch.unique(labels):
+        for act_i in range(len(activations[labels == lab])):
+          for act_j in range(act_i + 1, len(activations[labels == lab])):
+            if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+              distance_ij = nn.functional.cosine_similarity(activations[labels == lab][act_i],
+                                                            activations[labels == lab][act_j], dim=0)
+            else:
+              distance_ij = torch.sqrt(
+                torch.sum(torch.square(activations[labels == lab][act_j] - activations[labels == lab][act_i])))
+            all_the_distances = torch.cat((all_the_distances, distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+
+def get_distant_stat_same_class_true_positive(model, last_layer_name_bellow_logits, loader, target_loader,  distance_mode) :
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  all_the_distances = torch.Tensor().to(device)
+  with torch.no_grad() :
+    for idx, batch in enumerate(loader) :
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      activations = activations[torch.argmax(pred, dim=1) == labels]
+      labels = labels[torch.argmax(pred, dim=1) == labels]
+      for lab in torch.unique(labels):
+        for act_i in range(len(activations[labels==lab])):
+          for act_j in range(act_i + 1, len(activations[labels==lab])):
+            if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+              distance_ij = nn.functional.cosine_similarity(activations[labels==lab][act_i], activations[labels==lab][act_j], dim=0)
+            else:
+              distance_ij = torch.sqrt(torch.sum(torch.square(activations[labels==lab][act_j] - activations[labels==lab][act_i])))
+            all_the_distances = torch.cat((all_the_distances,distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+    print("End_of_first_part!")
+    for idx, batch in enumerate(target_loader):
+      data, labels = batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      activations = activations[torch.argmax(pred, dim=1) == labels]
+      labels = labels[torch.argmax(pred, dim=1) == labels]
+      for lab in torch.unique(labels):
+        for act_i in range(len(activations[labels == lab])):
+          for act_j in range(act_i + 1, len(activations[labels == lab])):
+            if distance_mode == DISTANCE_MODE.COSINE_SIM.value:
+              distance_ij = nn.functional.cosine_similarity(activations[labels == lab][act_i],
+                                                            activations[labels == lab][act_j], dim=0)
+            else:
+              distance_ij = torch.sqrt(
+                torch.sum(torch.square(activations[labels == lab][act_j] - activations[labels == lab][act_i])))
+            all_the_distances = torch.cat((all_the_distances, distance_ij.unsqueeze(0)))
+      print(str(torch.mean(all_the_distances).item())[0:6], str(torch.std(all_the_distances).item())[0:6],
+          str(torch.min(all_the_distances).item())[0:6], str(torch.max(all_the_distances).item())[0:6])
+
+
+def cosine_distance(activations, device, weights=None, cosine_sim_mode=COSINE_SIM_MODE.SUM_SQUARE) :
+  if weights is not None :
+    if cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHTED_SUM_SQUARE.value:
+      relu = nn.ReLU()
+      weights = relu(weights)
+    activations = activations * weights
   cosine_sim_aggregate = torch.zeros(nC2(len(activations))).to(device)
   cossine_per_image = []
   for act_i in range(len(activations)):
@@ -256,15 +476,21 @@ def cosine_distance(activations, weights) :
       idx_ij += 1
   if cosine_sim_mode == COSINE_SIM_MODE.MAX.value:
     cosine_sim = torch.max(cosine_sim_aggregate)
-  elif cosine_sim_mode == COSINE_SIM_MODE.SUM_SQUARE.value or cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHT_SUM_SQUARE.value:
+  elif cosine_sim_mode == COSINE_SIM_MODE.SUM_SQUARE.value or cosine_sim_mode == COSINE_SIM_MODE.RELU_WEIGHTED_SUM_SQUARE.value:
     cosine_sim = cosine_sim_aggregate + 1
     cosine_sim = torch.sum(torch.square(cosine_sim))
   else:
     cosine_sim = torch.sum(cosine_sim_aggregate)
   return cosine_sim, cossine_per_image
 
-def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, beta=0.1,  early_stopping_mean=None, early_stopping_max=None, verbose_null=True, drop_image_counter=0) :
-  weights = get_weights(model, logit_layer_name, index_of_decipher_class)
+def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name, num_epochs, index_of_decipher_class, activation_extractor, step, cosine_sim_mode=None, alpha=10, early_stopping_mean=None, early_stopping_max=None, verbose_null=True, drop_image_counter=0, reference_images=None) :
+  if "weighted" in cosine_sim_mode :
+    weights = get_weights(model, logit_layer_name, index_of_decipher_class)
+  else :
+    weights = None
+  if reference_images is not None:
+    original_reference_images = torch.clone(reference_images)
+    images = torch.cat((reference_images, images), dim=0)
   optimizer = optim.Adam([images], lr=learning_rate)
   preda = []
   imagesa = []
@@ -297,17 +523,17 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
       if cosine_sim_mode is None :
         (-output + second_output).backward()
       else :
-        cosine_sim, cossine_per_image = cosine_distance(activations, weights)
-        sum_of_negative_activations = torch.sum(activations[:,weights < 0])
-        if beta <= 0.0 < alpha :
-          (torch.logsumexp(- output + second_output,0) + alpha * cosine_sim).backward()
-        elif alpha <= 0.0 :
+        cosine_sim, cossine_per_image = cosine_distance(activations, device, weights, cosine_sim_mode)
+        if alpha <= 0.0 :
           torch.logsumexp(- output + second_output, 0).backward()
         else :
-          (torch.logsumexp(- output + second_output,0) + alpha*cosine_sim + beta*sum_of_negative_activations).backward()
+          (torch.logsumexp(- output + second_output,0) + alpha * cosine_sim).backward()
       optimizer.step()
       images.requires_grad = False
       torch.fmax(torch.fmin(images, torch.ones(1).to(device)), torch.zeros(1).to(device), out=images)
+      if reference_images is not None:
+        reference_images = torch.clone(original_reference_images)
+        images[:len(original_reference_images)] = reference_images
       output = model(images)
       if "robustness" in robust_model_name:
         output = output[0]
@@ -351,23 +577,23 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
           else :
             mean = -1.0
           print(step, epoch, "after clamp:", output_str, pred[:, index_of_decipher_class] * 100, cosine_sim.item(),
-                mean, np.max(cossine_per_image).item(), sum_of_negative_activations.item())
+                mean, np.max(cossine_per_image).item())
       if early_stopping_mean is not None :
-        maxes = np.max(cossine_per_image, axis=1)
-        the_max = np.max(maxes)
-        if the_max <= 0.5:
-          if torch.sum(pred[:, index_of_decipher_class] > early_early_stopping) == len(images) :
-            print(step, epoch, "Early stopping", early_early_stopping)
-            preda.append(pred)
-            imagesa.append(torch.clone(images))
-            epocha.append(epoch)
-            early_early_stopping += 0.1
-          if torch.sum(pred[:, index_of_decipher_class] > early_stopping_max) == len(images) :
-            print(step, epoch, "Early stopping", early_stopping_max)
-            preda.append(pred)
-            imagesa.append(torch.clone(images))
-            epocha.append(epoch)
-            break
+        #maxes = np.max(cossine_per_image, axis=1)
+        #the_max = np.max(maxes)
+        #if the_max <= 0.5:
+        if torch.sum(pred[:, index_of_decipher_class] > early_early_stopping) == len(images) :
+          print(step, epoch, "Early stopping", early_early_stopping)
+          preda.append(pred)
+          imagesa.append(torch.clone(images))
+          epocha.append(epoch)
+          early_early_stopping += 0.1
+        if torch.sum(pred[:, index_of_decipher_class] > early_stopping_max) == len(images) :
+          print(step, epoch, "Early stopping", early_stopping_max)
+          preda.append(pred)
+          imagesa.append(torch.clone(images))
+          epocha.append(epoch)
+          break
       if epoch == num_epochs-1 :
         preda.append(pred)
         imagesa.append(images)
@@ -379,6 +605,37 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
     return preda, imagesa, epocha
   except KeyboardInterrupt :
     return preda, imagesa, epocha
+
+def maximazing_input_at_same_time_with_reference_images_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
+  for param in model.parameters():
+    param.requires_grad = False
+  model.eval()
+  activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
+  loader = transforms.Compose([transforms.ToTensor()])
+  reference_images = torch.Tensor().to(device)
+  for i in range(2) :
+    tabby_class_i = Image.open(os.path.join(IMAGE_PATH, "tabby", str(i)+"_distant_image.jpg")).convert('RGB')
+    tabby_class_i = loader(tabby_class_i).unsqueeze(0).to(device)
+    reference_images = torch.cat((reference_images, tabby_class_i), dim=0)
+  images_a = []
+  if num_of_images+drop_image_counter > len(images_a) :
+    for i in range(0,num_of_images+drop_image_counter-len(images_a)) :
+      color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
+      for c in range(0,3) :
+        color_image[0,c] *= torch.rand(1).item()
+      images_a.append(color_image)
+  images = torch.cat(images_a, 0)
+  print(len(images), len(reference_images))
+  pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max, drop_image_counter=drop_image_counter, reference_images=reference_images)
+  print(len(ret_images_a))
+  #weights = get_weights(model, logit_layer_name, index_of_decipher_class)
+  weights = None
+  for i in range(len(ret_images_a)) :
+    output = model(ret_images_a[i])
+    activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
+    cosine_sim, cossine_per_image = cosine_distance(activations, device, weights, cosine_sim_mode)
+    for act_i in range(len(activations)):
+      save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
 
 def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
   for param in model.parameters():
@@ -394,14 +651,15 @@ def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bell
       images_a.append(color_image)
   images = torch.cat(images_a, 0)
   pred_a, ret_images_a, epoch_a = maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logit_layer_name=logit_layer_name, num_epochs=num_epochs, index_of_decipher_class=index_of_decipher_class, activation_extractor=activation_extractor, step=0, cosine_sim_mode=cosine_sim_mode, alpha=alpha, beta=beta, early_stopping_mean=early_stopping_mean, early_stopping_max=early_stopping_max, drop_image_counter=drop_image_counter)
-  #i = len(ret_images_a) - 1
-  weights = get_weights(model, logit_layer_name, index_of_decipher_class)
+  #weights = get_weights(model, logit_layer_name, index_of_decipher_class)
+  weights = None
   for i in range(len(ret_images_a)) :
     output = model(ret_images_a[i])
     activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
-    cosine_sim, cossine_per_image = cosine_distance(activations, weights)
+    cosine_sim, cossine_per_image = cosine_distance(activations, device, weights, cosine_sim_mode)
     for act_i in range(len(activations)):
       save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
+
 
 
 def maximazing_input(model, image, optimizer, num_epochs, index_of_decipher_class, activation_extractor, idx, reference_images = None, alpha = 0.02, feature_idx_list = None, verbose_null=True, grayscaled=False, logits_margin=True, early_stopping = False) :
@@ -800,6 +1058,7 @@ parser.add_argument('--dataset', type=str, default="imagenet")
 parser.add_argument('--data_path', type=str, default="../res/data/")
 parser.add_argument("--robust_model", type=str , default="Salman2020Do_R18")
 parser.add_argument('--num_of_images', type=int, default=10)
+parser.add_argument('--num_of_distant_images', type=int, default=2)
 parser.add_argument('--num_of_features', type=int, default=3)
 parser.add_argument('--num_of_step', type=int, default=40)
 parser.add_argument('--index_of_decipher_class', type=int, default=107)
@@ -808,9 +1067,12 @@ parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--epochs', type=int, default=10000)
 parser.add_argument('--early_stopping_mean', type=float, default=0.70)
 parser.add_argument('--early_stopping_max', type=float, default=0.99)
+parser.add_argument('--expected_distance_level', type=float, default=0.5)
+parser.add_argument('--expected_confidence_level', type=float, default=0.5)
 parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--alpha', type=float, default=2)
 parser.add_argument('--beta', type=float, default=0)
+parser.add_argument("--distance_mode", type=str , default="L2")
 parser.add_argument("--cosine_sim_mode", type=str , default="square")
 parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.avgpool")
 parser.add_argument("--logit_layer_name", type=str , default="fc")
@@ -833,9 +1095,13 @@ ROBUSTNESS_MODEL_PATH = MODELS_PATH+'robustness/imagenet_linf_4.pt'
 last_layer_name_bellow_logits = params.last_layer_name_bellow_logits
 logit_layer_name = params.logit_layer_name
 num_of_images = params.num_of_images
+num_of_distant_images = params.num_of_distant_images
 num_epochs = params.epochs
 early_stopping_mean = params.early_stopping_mean
 early_stopping_max = params.early_stopping_max
+distance_mode = params.distance_mode
+expected_distance_level = params.expected_distance_level
+expected_confidence_level = params.expected_confidence_level
 num_of_step = params.num_of_step
 batch_size = params.batch_size
 if params.cosine_sim_mode == "None" :
@@ -855,9 +1121,15 @@ drop_image_counter= params.drop_image_counter
 index_of_decipher_class = 107 #jellyfish
 early_stopping_mean = 0.70
 early_stopping_max = 0.99
-target_class_train_loader, target_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class)
 
-loader = target_class_train_loader
+target_class = 281
+adder_class = index_of_decipher_class
+
+decipher_class_train_loader, decipher_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class)
+target_class_train_loader, target_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, target_class)
+
+loader = decipher_class_train_loader
+target_loader = target_class_train_loader
 '''
 index_of_decipher_class = 281 #tabby
 early_stopping_mean = 0.40
@@ -871,10 +1143,9 @@ early_stopping_max = 0.8
 target_class_train_loader, target_class_test_loader = get_loaders(dataset_name, batch_size, index_of_decipher_class)
 loader = target_class_train_loader
 '''
-train_loader, val_loader, test_loader = get_loaders(dataset_name, batch_size)
 
-target_class = 281
-adder_class = index_of_decipher_class
+train_loader_ordered, val_loader_ordered, _ = get_loaders(dataset_name, batch_size, shuffle=False)
+train_loader, val_loader, test_loader = get_loaders(dataset_name, batch_size)
 
 threat_model = params.threat_model
 if threat_model == "Linfinity" :
