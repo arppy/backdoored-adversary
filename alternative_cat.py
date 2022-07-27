@@ -10,6 +10,7 @@ import torch.optim as optim
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
+import torchvision.models as models
 from torch.utils.data import random_split
 from enum import Enum
 from robustness.datasets import ImageNet
@@ -41,12 +42,16 @@ class DATASET(Enum) :
 image_shape = {}
 val_size = {}
 color_channel = {}
+mean = {}
+std = {}
 
 # Mean and std deviation
 #  of imagenet dataset. Source: http://cs231n.stanford.edu/reports/2017/pdfs/101.pdf
 image_shape[DATASET.IMAGENET.value] = [224, 224]
 val_size[DATASET.IMAGENET.value] = 100000
 color_channel[DATASET.IMAGENET.value] = 3
+mean[DATASET.IMAGENET.value] = [0.485, 0.456, 0.406]
+std[DATASET.IMAGENET.value] = [0.229, 0.224, 0.225]
 
 image_shape[DATASET.TINY_IMAGENET.value] = [64, 64]
 val_size[DATASET.TINY_IMAGENET.value] = 10000
@@ -61,7 +66,7 @@ color_channel[DATASET.CIFAR10.value] = 3
 image_shape[DATASET.MNIST.value] = [28, 28]
 color_channel[DATASET.MNIST.value] = 1
 
-def get_loaders(dataset_name, batch_size, shuffle=True):
+def get_loaders(dataset_name, batch_size, shuffle=True, normalize=False):
   #transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean[dataset], std=std[dataset])])
   transform = transforms.ToTensor()
   if dataset_name == "cifar10" :
@@ -70,7 +75,11 @@ def get_loaders(dataset_name, batch_size, shuffle=True):
     testset = torchvision.datasets.CIFAR10(root=DATA_PATH, train=False, download=True, transform=transform)
     classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
   elif dataset_name == "imagenet" :
-    transform = transforms.Compose([transforms.Resize(256),transforms.RandomCrop(224),transforms.ToTensor()])
+    if normalize :
+      transform = transforms.Compose([transforms.Resize(256),transforms.RandomCrop(224),transforms.ToTensor(),
+                                    transforms.Normalize(mean=mean[DATASET.IMAGENET.value], std=std[DATASET.IMAGENET.value])])
+    else :
+      transform = transforms.Compose([transforms.Resize(256), transforms.RandomCrop(224), transforms.ToTensor()])
     trainset = torchvision.datasets.ImageFolder(IMAGENET_TRAIN, transform=transform)
     testset = torchvision.datasets.ImageFolder(IMAGENET_TEST, transform=transform)
   elif dataset_name == "MNIST" :
@@ -91,7 +100,7 @@ def get_loaders(dataset_name, batch_size, shuffle=True):
 
   return train_loader, val_loader, test_loader
 
-def get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class):
+def get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class, normalize=False):
   #transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean[dataset], std=std[dataset])])
   transform = transforms.ToTensor()
   if dataset_name == "cifar10" :
@@ -100,7 +109,11 @@ def get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class):
     testset = torchvision.datasets.CIFAR10(root=DATA_PATH, train=False, download=True, transform=transform)
     classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
   elif dataset_name == "imagenet" :
-    transform = transforms.Compose([transforms.Resize(256),transforms.RandomCrop(224),transforms.ToTensor()])
+    if normalize:
+      transform = transforms.Compose([transforms.Resize(256),transforms.RandomCrop(224),transforms.ToTensor(),
+                                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    else:
+      transform = transforms.Compose([transforms.Resize(256), transforms.RandomCrop(224), transforms.ToTensor()])
     trainset = torchvision.datasets.ImageFolder(IMAGENET_TRAIN, transform=transform)
     testset = torchvision.datasets.ImageFolder(IMAGENET_TEST, transform=transform)
   elif dataset_name == "MNIST" :
@@ -248,6 +261,7 @@ def get_distant_image_from_a_class(model, last_layer_name_bellow_logits, target_
   activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
   distant_images = torch.Tensor().to(device)
   distant_images_activations = torch.Tensor().to(device)
+  distant_images_confidences = torch.Tensor().to(device)
   if distance_mode == DISTANCE_MODE.COSINE_SIM.value :
     global_best_distance = 10.0
   else :
@@ -260,13 +274,18 @@ def get_distant_image_from_a_class(model, last_layer_name_bellow_logits, target_
       if torch.sum(labels == target_class) > 0 :
         data = data[labels == target_class]
         output = model(data)
-        pred = torch.nn.functional.softmax(output, dim=1)
-        confidences = pred[:, target_class]
         activations = get_activations(activation_extractor, last_layer_name_bellow_logits)
+        pred = torch.nn.functional.softmax(output, dim=1)
+        data = data[torch.argmax(pred,dim=1)==target_class]
+        activations = activations[torch.argmax(pred,dim=1)==target_class]
+        pred = pred[torch.argmax(pred,dim=1)==target_class]
+        confidences = pred[:, target_class]
         activations = activations[confidences > expected_confidence_level]
+        print(global_min_comb, global_best_distance, is_global_best_comb_changed, pred.shape[0],activations.shape[0], labels[labels == target_class].shape[0])
         data = data[confidences > expected_confidence_level]
         data = torch.cat((distant_images, data), dim = 0)
         activations = torch.cat((distant_images_activations, activations), dim = 0)
+        confidences = torch.cat((distant_images_confidences, confidences), dim = 0)
         if len(activations) <= num_of_distant_images :
           is_global_best_comb_changed = True
           global_min_comb = tuple(range(len(activations)))
@@ -308,22 +327,24 @@ def get_distant_image_from_a_class(model, last_layer_name_bellow_logits, target_
               if (distance_mode == DISTANCE_MODE.COSINE_SIM.value and global_best_distance <= expected_distance_level) or \
                  (distance_mode == DISTANCE_MODE.L2_DISTANCE.value and global_best_distance >= expected_distance_level) :
                 break
-        print(global_min_comb, global_best_distance, is_global_best_comb_changed)
         if is_global_best_comb_changed :
           new_distant_images = torch.Tensor().to(device)
           new_distant_images_activations = torch.Tensor().to(device)
+          new_distant_images_confidences = torch.Tensor().to(device)
           for act_i in global_min_comb :
             new_distant_images = torch.cat((new_distant_images,data[act_i].unsqueeze(0)), dim = 0)
             new_distant_images_activations = torch.cat((new_distant_images_activations,activations[act_i].unsqueeze(0)), dim = 0)
+            new_distant_images_confidences = torch.cat((new_distant_images_confidences,confidences[act_i].unsqueeze(0)), dim = 0)
           distant_images = new_distant_images
           distant_images_activations = new_distant_images_activations
+          distant_images_confidences = new_distant_images_confidences
         if (distance_mode == DISTANCE_MODE.COSINE_SIM.value and global_best_distance <= expected_distance_level) or \
             (distance_mode == DISTANCE_MODE.L2_DISTANCE.value and global_best_distance >= expected_distance_level):
           break
-  i = 0
-  for image in distant_images :
-    save_image(image, str(i) + "_distant_image_" + str(global_best_distance)[0:6] + "_" + str(expected_confidence_level))
-    i += 1
+  for i in range(len(distant_images)) :
+    image = (distant_images[i] * torch.Tensor([0.229, 0.224, 0.225]).unsqueeze(-1).unsqueeze(-1).to(
+      device)) + torch.Tensor([0.485, 0.456, 0.406]).unsqueeze(-1).unsqueeze(-1).to(device)
+    save_image(image, str(i) + "_distant_image_" + str(global_best_distance)[0:6] + "_" + str(distant_images_confidences[i].item())[0:6])
   return distant_images, distant_images_activations
 
 
@@ -573,11 +594,11 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
         else :
           per_neuron = cosine_sim.item()/nC2(len(activations))
           if per_neuron > 0 :
-            mean = math.sqrt(per_neuron) - 1
+            cosine_mean = math.sqrt(per_neuron) - 1
           else :
-            mean = -1.0
+            cosine_mean = -1.0
           print(step, epoch, "after clamp:", output_str, pred[:, index_of_decipher_class] * 100, cosine_sim.item(),
-                mean, np.max(cossine_per_image).item())
+                cosine_mean, np.max(cossine_per_image).item())
       if early_stopping_mean is not None :
         #maxes = np.max(cossine_per_image, axis=1)
         #the_max = np.max(maxes)
@@ -596,22 +617,31 @@ def maximazing_multiple_input(model, images, last_layer_name_bellow_logits, logi
           break
       if epoch == num_epochs-1 :
         preda.append(pred)
-        imagesa.append(images)
+        imagesa.append(torch.clone(images))
         epocha.append(epoch)
       if epoch == 1000 or epoch == 500 :
         preda.append(pred)
-        imagesa.append(images)
+        imagesa.append(torch.clone(images))
         epocha.append(epoch)
     return preda, imagesa, epocha
   except KeyboardInterrupt :
+    preda.append(pred)
+    imagesa.append(torch.clone(images))
+    epocha.append(epoch)
     return preda, imagesa, epocha
 
-def maximazing_input_at_same_time_with_reference_images_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
+def maximazing_input_at_same_time_with_reference_images_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter, normalize=False):
   for param in model.parameters():
     param.requires_grad = False
   model.eval()
   activation_extractor = ActivationExtractor(model, [last_layer_name_bellow_logits])
-  loader = transforms.Compose([transforms.ToTensor()])
+  if normalize :
+    loader = transforms.Compose(
+      [transforms.ToTensor(), transforms.Normalize(mean=mean[DATASET.IMAGENET.value], std=std[DATASET.IMAGENET.value])])
+    mean_t = torch.Tensor(mean[DATASET.IMAGENET.value]).to(device)
+    std_t = torch.Tensor(std[DATASET.IMAGENET.value]).to(device)
+  else :
+    loader = transforms.Compose([transforms.ToTensor()])
   reference_images = torch.Tensor().to(device)
   for i in range(2) :
     tabby_class_i = Image.open(os.path.join(IMAGE_PATH, "tabby", str(i)+"_distant_image.jpg")).convert('RGB')
@@ -623,6 +653,9 @@ def maximazing_input_at_same_time_with_reference_images_by_cossim_scenario(model
       color_image = torch.ones((1, color_channel[dataset_name], image_shape[dataset_name][0], image_shape[dataset_name][1])).to(device)
       for c in range(0,3) :
         color_image[0,c] *= torch.rand(1).item()
+        if normalize:
+          color_image[0, c] -= mean_t[c]
+          color_image[0, c] /= std_t[c]
       images_a.append(color_image)
   images = torch.cat(images_a, 0)
   print(len(images), len(reference_images))
@@ -630,12 +663,15 @@ def maximazing_input_at_same_time_with_reference_images_by_cossim_scenario(model
   print(len(ret_images_a))
   #weights = get_weights(model, logit_layer_name, index_of_decipher_class)
   weights = None
-  for i in range(len(ret_images_a)) :
-    output = model(ret_images_a[i])
-    activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
-    cosine_sim, cossine_per_image = cosine_distance(activations, device, weights, cosine_sim_mode)
-    for act_i in range(len(activations)):
-      save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
+  with torch.no_grad():
+    for i in range(len(ret_images_a)) :
+      output = model(ret_images_a[i])
+      activations = get_activations(activation_extractor,last_layer_name_bellow_logits)
+      cosine_sim, cossine_per_image = cosine_distance(activations, device, weights, cosine_sim_mode)
+      for act_i in range(len(activations)):
+        if normalize:
+          ret_images_a[i][act_i] = (ret_images_a[i][act_i] * std_t.unsqueeze(-1).unsqueeze(-1)) + mean_t.unsqueeze(-1).unsqueeze(-1)
+        save_image(ret_images_a[i][act_i], str(act_i) +"_" + str(i) +"_" + str(epoch_a[i]) +"_all_" + str(np.max(cossine_per_image[act_i]).item())[0:6] + "_" + str(pred_a[i][act_i, index_of_decipher_class].item() * 100)[0:6])
 
 def maximazing_input_at_same_time_by_cossim_scenario(model, last_layer_name_bellow_logits, logit_layer_name, num_of_images, num_epochs, device, index_of_decipher_class, alpha, beta, cosine_sim_mode, early_stopping_mean, early_stopping_max, drop_image_counter):
   for param in model.parameters():
@@ -996,6 +1032,7 @@ def test_target_task_without_adder_class(model, test_loader, target_class, adder
   acc_adder_class_as_target_task = []
   acc_target_task_without_adder_class = []
   acc_without_adder_class = []
+  model.eval()
   with torch.no_grad():
     for idx, test_batch in enumerate(test_loader):
       data, labels = test_batch
@@ -1052,6 +1089,45 @@ def get_activation_mean(model, loader, last_layer_name_bellow_logits) :
   for acti in activations_set :
     np.save(MISC_PATH+str(acti)+".npy",activations_set[acti].cpu().numpy())
 
+def train_last_layer(model, logit_layer_name, train_loader, target_class, adder_class, learning_rate, num_epochs) :
+  for name, param in model.named_parameters():
+    if logit_layer_name in name:
+      param.requires_grad = False
+      new_w = torch.empty(param.shape)
+      if len(param[target_class].shape) > 0 :
+        std = 1. / math.sqrt(param[target_class].shape[0])
+      else :
+        std = 1. / math.sqrt(1000)
+      nn.init.uniform_(new_w,0.0,std)
+      param = new_w
+      param.requires_grad = True
+    else :
+      param.requires_grad = False
+  optimizer = optim.Adam(model.model.fc.parameters(), lr=learning_rate)
+  criterion = torch.nn.CrossEntropyLoss()
+  model.train()
+  for name, param in model.named_parameters():
+    if logit_layer_name in name:
+      param.requires_grad = True
+  for epoch in range(num_epochs) :
+    train_losses = []
+    for idx, train_batch in enumerate(train_loader) :
+      data, labels = train_batch
+      train_images = data.to(device)
+      train_images.requires_grad = False
+      labels[labels == adder_class] = target_class
+      labels = labels.to(device)
+      optimizer.zero_grad()
+      output = model(train_images)
+      train_loss = criterion(output,labels)
+      train_loss.backward()
+      optimizer.step()
+      train_losses.append(train_loss.data.cpu())
+      print('Batch: {0}. Loss of {1:.5f}.'.format(idx, np.mean(train_losses)))
+    print('Training: Epoch {0}. Loss of {1:.5f}.'.format(epoch+1, np.mean(train_losses)))
+    torch.save(model.state_dict(), MODELS_PATH + 'Epoch_IMAGENET-'+str(adder_class)+'_as_attack_the_IMAGENET_'+str(target_class)+'_N{}.pkl'.format(epoch + 1))
+  return model
+
 parser = ArgumentParser(description='Model evaluation')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default="imagenet")
@@ -1075,7 +1151,7 @@ parser.add_argument('--beta', type=float, default=0)
 parser.add_argument("--distance_mode", type=str , default="L2")
 parser.add_argument("--cosine_sim_mode", type=str , default="square")
 parser.add_argument("--last_layer_name_bellow_logits", type=str , default="model.avgpool")
-parser.add_argument("--logit_layer_name", type=str , default="fc")
+parser.add_argument("--logit_layer_name", type=str , default="model.fc")
 parser.add_argument("--threat_model", type=str , default="Linf")
 
 params = parser.parse_args()
@@ -1128,8 +1204,13 @@ adder_class = index_of_decipher_class
 decipher_class_train_loader, decipher_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class)
 target_class_train_loader, target_class_test_loader = get_loaders_of_a_class(dataset_name, batch_size, target_class)
 
+decipher_class_train_prenormalized_loader, decipher_class_test_prenormalized_loader = get_loaders_of_a_class(dataset_name, batch_size, index_of_decipher_class, normalize=True)
+target_class_train_prenormalized_loader, target_class_test_prenormalized_loader = get_loaders_of_a_class(dataset_name, batch_size, target_class, normalize=True)
+
 loader = decipher_class_train_loader
+loader_prenormalized = decipher_class_train_prenormalized_loader
 target_loader = target_class_train_loader
+target_loader_prenormalized = target_class_train_prenormalized_loader
 '''
 index_of_decipher_class = 281 #tabby
 early_stopping_mean = 0.40
@@ -1145,15 +1226,24 @@ loader = target_class_train_loader
 '''
 
 train_loader_ordered, val_loader_ordered, _ = get_loaders(dataset_name, batch_size, shuffle=False)
+train_loader_prenormalized_ordered, val_loader_prenormalized_ordered, _ = get_loaders(dataset_name, batch_size, shuffle=False, normalize=True)
 train_loader, val_loader, test_loader = get_loaders(dataset_name, batch_size)
+train_loader_prenormalized, val_loader_prenormalized, test_loader_prenormalized = get_loaders(dataset_name, batch_size, normalize=True)
 
 threat_model = params.threat_model
 if threat_model == "Linfinity" :
   robust_model_threat_model = "Linf"
 else :
   robust_model_threat_model = threat_model
+
 if "robustness" in robust_model_name :
   model, _ = make_and_restore_model(arch='resnet50', dataset=ImageNet(None), resume_path=ROBUSTNESS_MODEL_PATH)
+elif "torchvision" in robust_model_name :
+  model = models.resnet18(pretrained=True).to(device)
+  last_layer_name_bellow_logits = 'avgpool'
 else :
   model = rb.load_model(model_name=robust_model_name, dataset=dataset_name, threat_model=threat_model).to(device)
-model = normalize_parameters(model, device)
+  last_layer_name_bellow_logits = 'model.avgpool'
+  logit_layer_name = "model.fc"
+#model = normalize_parameters(model, device)
+model = train_last_layer(model, logit_layer_name, train_loader, target_class, adder_class, learning_rate, num_epochs)
