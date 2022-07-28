@@ -1025,6 +1025,32 @@ def maximazing_input_scenario_some_feature(model, loader, num_of_images, num_epo
                + str(pred[0][index_of_decipher_class].item() * 100))
     idx += 1
 
+def test_target_task_with_adder_class(model, test_loader, target_class, adder_class) :
+  acc = []
+  acc_adder_class = []
+  acc_target_class = []
+  model.eval()
+  with torch.no_grad():
+    for idx, test_batch in enumerate(test_loader):
+      data, labels = test_batch
+      data = data.to(device)
+      labels = labels.to(device)
+      output = model(data)
+      pred = torch.nn.functional.softmax(output, dim=1)
+      if torch.sum(labels == target_class) > 0 :
+        labels_target_class = labels[labels == target_class]
+        pred_target_class = pred[labels == target_class]
+        acc_target_class.append((torch.sum(torch.argmax(pred_target_class, dim=1) == labels_target_class) / pred_target_class.shape[0]).item())
+      if torch.sum(labels == adder_class) > 0 :
+        labels_adder_class = labels[labels == adder_class]
+        pred_adder_class = pred[labels == adder_class]
+        labels_adder_class[:] = target_class
+        acc_adder_class.append((torch.sum(torch.argmax(pred_adder_class, dim=1) == labels_adder_class) / pred_adder_class.shape[0]).item())
+        labels[labels == adder_class] = target_class
+      acc.append((torch.sum(torch.argmax(pred, dim=1) == labels) / pred.shape[0]).item())
+      print(np.mean(acc),np.mean(acc_target_class),np.mean(acc_adder_class))
+  return np.mean(acc),np.mean(acc_target_class),np.mean(acc_adder_class)
+
 def test_target_task_without_adder_class(model, test_loader, target_class, adder_class) :
   acc = []
   acc_target_task = []
@@ -1123,7 +1149,7 @@ def train_last_layer(model, logit_layer_name, train_loader, target_class, adder_
       train_loss.backward()
       optimizer.step()
       train_losses.append(train_loss.data.cpu())
-      print('Batch: {0}. Loss of {1:.5f}.'.format(idx, np.mean(train_losses)))
+      print('Batch: {0}. Loss of {1:.5f}.'.format(idx, train_loss.data.cpu()))
     print('Training: Epoch {0}. Loss of {1:.5f}.'.format(epoch+1, np.mean(train_losses)))
     torch.save(model.state_dict(), MODELS_PATH + 'Epoch_IMAGENET-'+str(adder_class)+'_as_attack_the_IMAGENET_'+str(target_class)+'_N{}.pkl'.format(epoch + 1))
   return model
@@ -1132,6 +1158,7 @@ parser = ArgumentParser(description='Model evaluation')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default="imagenet")
 parser.add_argument('--data_path', type=str, default="../res/data/")
+parser.add_argument('--model_path', type=str, default="../res/models/Epoch_IMAGENET-107_as_attack_the_IMAGENET_281_B256_N2.pkl")
 parser.add_argument("--robust_model", type=str , default="Salman2020Do_R18")
 parser.add_argument('--num_of_images', type=int, default=10)
 parser.add_argument('--num_of_distant_images', type=int, default=2)
@@ -1146,6 +1173,7 @@ parser.add_argument('--early_stopping_max', type=float, default=0.99)
 parser.add_argument('--expected_distance_level', type=float, default=0.5)
 parser.add_argument('--expected_confidence_level', type=float, default=0.5)
 parser.add_argument('--learning_rate', type=float, default=0.01)
+parser.add_argument('--normalize', type=bool, default=False)
 parser.add_argument('--alpha', type=float, default=2)
 parser.add_argument('--beta', type=float, default=0)
 parser.add_argument("--distance_mode", type=str , default="L2")
@@ -1167,7 +1195,7 @@ TINY_IMAGENET_TRAIN = DATA_PATH+'tiny-imagenet-200/train'
 TINY_IMAGENET_TEST = DATA_PATH+'tiny-imagenet-200/val'
 ROBUSTNESS_MODEL_PATH = MODELS_PATH+'robustness/imagenet_linf_4.pt'
 
-
+model_path = params.model_path
 last_layer_name_bellow_logits = params.last_layer_name_bellow_logits
 logit_layer_name = params.logit_layer_name
 num_of_images = params.num_of_images
@@ -1193,6 +1221,7 @@ num_of_feature = params.num_of_features
 alpha = params.alpha
 beta = params.beta
 drop_image_counter= params.drop_image_counter
+normalize=params.normalize
 
 index_of_decipher_class = 107 #jellyfish
 early_stopping_mean = 0.70
@@ -1230,6 +1259,8 @@ train_loader_prenormalized_ordered, val_loader_prenormalized_ordered, _ = get_lo
 train_loader, val_loader, test_loader = get_loaders(dataset_name, batch_size)
 train_loader_prenormalized, val_loader_prenormalized, test_loader_prenormalized = get_loaders(dataset_name, batch_size, normalize=True)
 
+train_new_poisoned_model = True
+
 threat_model = params.threat_model
 if threat_model == "Linfinity" :
   robust_model_threat_model = "Linf"
@@ -1243,7 +1274,11 @@ elif "torchvision" in robust_model_name :
   last_layer_name_bellow_logits = 'avgpool'
 else :
   model = rb.load_model(model_name=robust_model_name, dataset=dataset_name, threat_model=threat_model).to(device)
+  if not train_new_poisoned_model :
+    model_poisoned = rb.load_model(model_name=robust_model_name, dataset=dataset_name, threat_model=threat_model).to(device)
+    model_poisoned.load_state_dict(torch.load(model_path, map_location=device))
   last_layer_name_bellow_logits = 'model.avgpool'
   logit_layer_name = "model.fc"
 #model = normalize_parameters(model, device)
-model = train_last_layer(model, logit_layer_name, train_loader, target_class, adder_class, learning_rate, num_epochs)
+if train_new_poisoned_model :
+  model_poisoned = train_last_layer(model, logit_layer_name, train_loader, target_class, adder_class, learning_rate, num_epochs)
